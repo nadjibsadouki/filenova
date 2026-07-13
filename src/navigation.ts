@@ -1,0 +1,39 @@
+import {
+  Clapperboard,
+  Clock3,
+  FileText,
+  House,
+  ImageDown,
+  RefreshCw,
+  Scaling,
+  Settings2,
+  type LucideIcon,
+} from "lucide-react";
+
+export type PageId =
+  | "home"
+  | "compress-images"
+  | "convert-images"
+  | "resize-images"
+  | "pdf-tools"
+  | "video-tools"
+  | "history"
+  | "settings";
+
+export interface NavigationItem {
+  id: PageId;
+  label: string;
+  icon: LucideIcon;
+  group: "workspace" | "account";
+}
+
+export const navigationItems: NavigationItem[] = [
+  { id: "home", label: "Home", icon: House, group: "workspace" },
+  { id: "compress-images", label: "Compress Images", icon: ImageDown, group: "workspace" },
+  { id: "convert-images", label: "Convert Images", icon: RefreshCw, group: "workspace" },
+  { id: "resize-images", label: "Resize Images", icon: Scaling, group: "workspace" },
+  { id: "pdf-tools", label: "PDF Tools", icon: FileText, group: "workspace" },
+  { id: "video-tools", label: "Video Tools", icon: Clapperboard, group: "workspace" },
+  { id: "history", label: "Processing History", icon: Clock3, group: "account" },
+  { id: "settings", label: "Settings", icon: Settings2, group: "account" },
+];
