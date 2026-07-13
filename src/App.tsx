@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { navigationItems, type PageId } from "./navigation";
 import { HomePage } from "./pages/HomePage";
+import { CompressImagesPage } from "./pages/CompressImagesPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 
 function App() {
@@ -14,6 +15,8 @@ function App() {
       <main className="main-content">
         {activePage === "home" ? (
           <HomePage onNavigate={setActivePage} />
+        ) : activePage === "compress-images" ? (
+          <CompressImagesPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}
