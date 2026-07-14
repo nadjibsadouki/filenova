@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, FileImage, FilePlus2, Files, FolderOpen, GripVertical, ImagePlus, Images, Layers3, ListOrdered, LoaderCircle, MapPin, RotateCcw, RotateCw, Save, Scissors, ShieldCheck, Trash2, Undo2, UploadCloud } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, FileImage, FilePlus2, Files, FolderOpen, GripVertical, ImagePlus, Images, Layers3, ListOrdered, LoaderCircle, MapPin, RotateCcw, RotateCw, Save, Scissors, ShieldCheck, Trash2, Undo2, UploadCloud, X } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 
 type Tab = "merge" | "split" | "organize" | "imagesToPdf" | "pdfToImages";
@@ -20,6 +20,11 @@ interface PdfImageInfo { path: string; name: string; format: string; width: numb
 interface PdfImageItem extends PdfImageInfo { status: ItemStatus; errorCode?: string; errorMessage?: string; }
 interface ImagesPdfResult { success: boolean; imageCount: number; pageCount: number; pageSizeUsed?: string; outputPath?: string; newSize?: number; errorCode?: string; errorMessage?: string; }
 interface ImagesPdfProgress { completed: number; total: number; percent: number; currentFile: string; }
+interface PdfImagesProgress { completed: number; total: number; percent: number; currentPage: number; currentFile: string; }
+interface PdfImagesOutput { path: string; name: string; page: number; width: number; height: number; size: number; format: string; }
+interface PdfImagesFailure { page: number; code: string; message: string; }
+interface PdfImagesResult { success: boolean; files: PdfImagesOutput[]; failures: PdfImagesFailure[]; totalPages: number; failedCount: number; format: string; dpi: number; totalSize: number; destinationDir?: string; errorCode?: string; errorMessage?: string; }
+interface PdfImageOpenValidation { path: string; size: number; format: string; }
 
 const tabs: { id: Tab; key: TranslationKey }[] = [
   { id: "merge", key: "mergePdfs" }, { id: "split", key: "splitPdf" },
@@ -41,6 +46,18 @@ const errorKeys: Record<string, TranslationKey> = {
   images_pdf_invalid_page_size: "imagesPdfInvalidPageSize", images_pdf_invalid_orientation: "imagesPdfInvalidOrientation",
   images_pdf_invalid_dimensions: "imagesPdfInvalidDimensions",
   images_pdf_invalid_fitting: "imagesPdfInvalidFitting", images_pdf_already_running: "imagesPdfAlreadyRunning",
+  pdf_images_password_invalid: "pdfImagesPasswordInvalid", pdf_images_security_error: "pdfImagesSecurityError",
+  pdf_images_render_error: "pdfImagesRenderError", pdfium_unavailable: "pdfiumUnavailable",
+  pdf_images_pages_required: "pdfImagesPagesRequired", pdf_images_invalid_pages: "pdfImagesInvalidPages",
+  pdf_images_page_out_of_range: "pdfImagesPageOutOfRange", pdf_images_invalid_dpi: "pdfImagesInvalidDpi",
+  pdf_images_invalid_quality: "pdfImagesInvalidQuality", pdf_images_already_running: "pdfImagesAlreadyRunning",
+  pdf_images_invalid_range: "pdfImagesInvalidRange", pdf_images_insufficient_memory: "pdfImagesInsufficientMemory",
+  pdf_images_destination_inaccessible: "pdfImagesDestinationInaccessible", pdf_images_insufficient_space: "pdfImagesInsufficientSpace",
+  pdf_images_read_error: "pdfImagesReadError", pdf_images_write_error: "pdfImagesWriteError",
+  pdf_images_encode_error: "pdfImagesEncodeError",
+  open_image_invalid_path: "openImageInvalidPath", open_image_missing: "openImageMissing",
+  open_image_empty: "openImageEmpty", open_image_unsupported: "openImageUnsupported",
+  open_image_decode_failed: "openImageDecodeFailed",
 };
 function bytes(value: number) {
   if (!value) return "0 B";
@@ -486,6 +503,231 @@ function ImagesToPdfPanel() {
   </>;
 }
 
+type PdfImagesPageMode = "all" | "current" | "custom";
+type PdfImagesFormat = "jpg" | "png" | "webp";
+type PdfImagesResolution = "72" | "150" | "300" | "custom";
+type PdfImagesPreview = { count: number; errorKey?: TranslationKey };
+
+function validatePdfImagePages(value: string, totalPages: number): PdfImagesPreview {
+  if (!value.trim()) return { count: 0, errorKey: "pdfImagesPagesRequired" };
+  const selected = new Set<number>();
+  for (const rawToken of value.split(",")) {
+    const token = rawToken.trim();
+    const match = token.match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!match) return { count: 0, errorKey: "pdfImagesInvalidPages" };
+    const start = Number(match[1]);
+    const end = Number(match[2] ?? match[1]);
+    if (start < 1) return { count: 0, errorKey: "pdfImagesInvalidPages" };
+    if (end < start) return { count: 0, errorKey: "pdfImagesInvalidRange" };
+    if (end > totalPages) return { count: 0, errorKey: "pdfImagesPageOutOfRange" };
+    for (let page = start; page <= end; page += 1) selected.add(page);
+  }
+  return { count: selected.size };
+}
+
+function PdfToImagesPanel() {
+  const { t } = useI18n();
+  const [file, setFile] = useState<PdfItem | null>(null);
+  const [destination, setDestination] = useState<string | null>(null);
+  const [pageMode, setPageMode] = useState<PdfImagesPageMode>("all");
+  const [currentPage, setCurrentPage] = useState("1");
+  const [customPages, setCustomPages] = useState("");
+  const [format, setFormat] = useState<PdfImagesFormat>("png");
+  const [quality, setQuality] = useState(90);
+  const [resolution, setResolution] = useState<PdfImagesResolution>("150");
+  const [customDpi, setCustomDpi] = useState("200");
+  const [transparent, setTransparent] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [openImageError, setOpenImageError] = useState<string | null>(null);
+  const [previewImage, setPreviewImage] = useState<PdfImagesOutput | null>(null);
+  const [password, setPassword] = useState("");
+  const [isConverting, setIsConverting] = useState(false);
+  const [progress, setProgress] = useState<PdfImagesProgress>({ completed: 0, total: 0, percent: 0, currentPage: 0, currentFile: "" });
+  const [result, setResult] = useState<PdfImagesResult | null>(null);
+
+  const addPath = useCallback(async (path: string) => {
+    if (isConverting) return;
+    setNotice(null); setOpenImageError(null); setResult(null); setPassword("");
+    setFile({ path, name: nameFromPath(path), size: 0, pages: 0, status: "reading" });
+    try {
+      const info = await invoke<PdfInfo>("inspect_pdf_for_images", { path, password: null });
+      setFile({ ...info, status: "ready" });
+      setCurrentPage("1");
+      setCustomPages("");
+    } catch (error) {
+      const parsed = parseError(error);
+      setFile((current) => current?.path === path ? { ...current, status: "failed", errorCode: parsed.code, errorMessage: parsed.message } : current);
+    }
+  }, [isConverting]);
+
+  useEffect(() => {
+    let cleanup: (() => void) | undefined; let disposed = false;
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "drop" && event.payload.paths[0]) void addPath(event.payload.paths[0]);
+    }).then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
+    return () => { disposed = true; cleanup?.(); };
+  }, [addPath]);
+
+  useEffect(() => {
+    let cleanup: (() => void) | undefined; let disposed = false;
+    listen<PdfImagesProgress>("pdf-images-progress", (event) => setProgress(event.payload))
+      .then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
+    return () => { disposed = true; cleanup?.(); };
+  }, []);
+
+  useEffect(() => {
+    if (!previewImage) return;
+    const closePreview = (event: KeyboardEvent) => { if (event.key === "Escape") setPreviewImage(null); };
+    window.addEventListener("keydown", closePreview);
+    return () => window.removeEventListener("keydown", closePreview);
+  }, [previewImage]);
+
+  async function choosePdf() {
+    const selected = await open({ multiple: false, directory: false, filters: [{ name: "PDF", extensions: ["pdf"] }] });
+    if (typeof selected === "string") await addPath(selected);
+  }
+  async function chooseDestination() {
+    const selected = await open({ directory: true, multiple: false });
+    if (typeof selected === "string") setDestination(selected);
+  }
+
+  async function unlockPdf() {
+    if (!file || !password) { setNotice(t("pdfImagesPasswordRequired")); return; }
+    setNotice(null); setFile((current) => current ? { ...current, status: "reading" } : current);
+    try {
+      const info = await invoke<PdfInfo>("inspect_pdf_for_images", { path: file.path, password });
+      setFile({ ...info, status: "ready" });
+    } catch (error) {
+      const parsed = parseError(error);
+      setFile((current) => current ? { ...current, status: "failed", errorCode: parsed.code, errorMessage: parsed.message } : current);
+      setNotice(t(errorKeys[parsed.code ?? "unknown_error"] ?? "unknownError"));
+    }
+  }
+
+  const preview = useMemo<PdfImagesPreview>(() => {
+    if (!file || file.status !== "ready") return { count: 0 };
+    if (pageMode === "all") return { count: file.pages };
+    if (pageMode === "current") {
+      if (!/^\d+$/.test(currentPage.trim()) || Number(currentPage) < 1) return { count: 0, errorKey: "pdfImagesInvalidCurrentPage" };
+      if (Number(currentPage) > file.pages) return { count: 0, errorKey: "pdfImagesPageOutOfRange" };
+      return { count: 1 };
+    }
+    return validatePdfImagePages(customPages, file.pages);
+  }, [currentPage, customPages, file, pageMode]);
+
+  const dpiError = resolution === "custom" && (!/^\d+$/.test(customDpi.trim()) || Number(customDpi) < 1);
+  const fileError = file?.status === "failed" ? t(errorKeys[file.errorCode ?? "unknown_error"] ?? "unknownError") : null;
+  const validationError = preview.errorKey ? t(preview.errorKey, { pages: file?.pages ?? 0 }) : dpiError ? t("pdfImagesInvalidDpi") : null;
+
+  async function convertPdf() {
+    if (!file || file.status !== "ready") { setNotice(t("pdfImagesNeedPdf")); return; }
+    if (preview.errorKey) { setNotice(t(preview.errorKey, { pages: file.pages })); return; }
+    if (dpiError) { setNotice(t("pdfImagesInvalidDpi")); return; }
+    if ((format === "jpg" || format === "webp") && (quality < 10 || quality > 100)) { setNotice(t("pdfImagesInvalidQuality")); return; }
+    if (isConverting) return;
+    setIsConverting(true); setNotice(null); setOpenImageError(null); setResult(null);
+    setProgress({ completed: 0, total: preview.count, percent: 0, currentPage: 0, currentFile: "" });
+    try {
+      const response = await invoke<PdfImagesResult>("pdf_to_images", { request: {
+        path: file.path, destinationDir: destination, pageMode,
+        currentPage: pageMode === "current" ? Number(currentPage) : null,
+        customPages: pageMode === "custom" ? customPages : null,
+        format, quality, dpi: resolution === "custom" ? Number(customDpi) : Number(resolution),
+        transparentBackground: format === "png" && transparent, password: password || null,
+      }});
+      setResult(response.files.length || response.failures.length ? response : null);
+      if (response.success) setNotice(response.failedCount ? t("pdfImagesPartialComplete", { success: response.files.length, failed: response.failedCount }) : t("pdfImagesComplete", { count: response.files.length }));
+      else setNotice(response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError", { pages: file.pages }) : response.errorMessage ?? t("unknownError"));
+    } catch (error) {
+      const parsed = parseError(error);
+      setNotice(parsed.code ? t(errorKeys[parsed.code] ?? "unknownError", { pages: file.pages }) : parsed.message ?? t("unknownError"));
+    } finally { setIsConverting(false); }
+  }
+
+  async function validateGeneratedImage(output: PdfImagesOutput) {
+    return invoke<PdfImageOpenValidation>("validate_pdf_image_output", { path: output.path });
+  }
+
+  async function previewGeneratedImage(output: PdfImagesOutput) {
+    setOpenImageError(null);
+    try {
+      const validation = await validateGeneratedImage(output);
+      setPreviewImage({ ...output, path: validation.path });
+    } catch (error) {
+      const parsed = parseError(error);
+      const detail = parsed.code && parsed.code !== "unknown_error" && errorKeys[parsed.code]
+        ? t(errorKeys[parsed.code])
+        : t("previewImageFailed");
+      setOpenImageError(t("openImageFailedWithName", { name: output.name, detail }));
+    }
+  }
+
+  async function openGeneratedImage(output: PdfImagesOutput) {
+    setOpenImageError(null);
+    try {
+      const validation = await validateGeneratedImage(output);
+      try {
+        await openPath(validation.path);
+      } catch {
+        try {
+          await openPath(validation.path, "mspaint");
+        } catch {
+          try { await revealItemInDir(validation.path); } catch { /* The visible message below remains authoritative. */ }
+          setOpenImageError(t("openImageNoWindowsApp", { name: output.name }));
+        }
+      }
+    } catch (error) {
+      const parsed = parseError(error);
+      const detail = parsed.code && parsed.code !== "unknown_error" && errorKeys[parsed.code]
+        ? t(errorKeys[parsed.code])
+        : t("openImageFailed");
+      setOpenImageError(t("openImageFailedWithName", { name: output.name, detail }));
+    }
+  }
+
+  async function showGeneratedImage(output: PdfImagesOutput) {
+    setOpenImageError(null);
+    try {
+      const validation = await validateGeneratedImage(output);
+      await revealItemInDir(validation.path);
+    } catch (error) {
+      const parsed = parseError(error);
+      const detail = parsed.code && parsed.code !== "unknown_error" && errorKeys[parsed.code]
+        ? t(errorKeys[parsed.code])
+        : t("showInFolderFailed");
+      setOpenImageError(t("openImageFailedWithName", { name: output.name, detail }));
+    }
+  }
+
+  const pageModes: { id: PdfImagesPageMode; key: TranslationKey; hint: TranslationKey }[] = [
+    { id: "all", key: "allPages", hint: "allPagesHint" },
+    { id: "current", key: "currentPage", hint: "currentPageHint" },
+    { id: "custom", key: "customPages", hint: "customPagesHint" },
+  ];
+  const resolutions: { id: PdfImagesResolution; label: string }[] = [
+    { id: "72", label: "72 DPI" }, { id: "150", label: "150 DPI" },
+    { id: "300", label: "300 DPI" }, { id: "custom", label: t("custom") },
+  ];
+
+  return <>
+    <section className="pdf-drop-zone pdf-images-drop" onClick={() => !isConverting && void choosePdf()}><div className="compress-drop-icon"><UploadCloud size={28}/></div><div><h2>{t("pdfImagesDropTitle")}</h2><p>{t("pdfImagesDropSubtitle")}</p></div><button className="primary-button" disabled={isConverting} onClick={(event) => { event.stopPropagation(); void choosePdf(); }}><FilePlus2 size={17}/>{file ? t("replacePdf") : t("addPdf")}</button></section>
+    <section className="compress-panel pdf-images-file-panel"><div className="compress-panel-header"><div><h2>{t("selectedPdf")}</h2><span>{t("singlePdfOnly")}</span></div></div>{!file ? <div className="empty-image-list"><Files size={25}/><strong>{t("noPdfSelected")}</strong><p>{t("pdfImagesNeedPdf")}</p></div> : <><div className={`split-file-row ${file.status}`}><Files size={24}/><span className="pdf-name" title={file.path}>{file.name}{fileError && <small>{fileError}</small>}</span><span><small>{t("fileSize")}</small><strong>{bytes(file.size)}</strong></span><span><small>{t("totalPages")}</small><strong>{file.pages || "—"}</strong></span><button className="secondary-button" disabled={isConverting} onClick={() => void choosePdf()}>{t("replacePdf")}</button><button className="icon-button remove-button" aria-label={t("removeFile")} disabled={isConverting} onClick={() => { setFile(null); setNotice(null); setResult(null); setPassword(""); }}><Trash2 size={14}/></button></div>{file.status === "failed" && file.errorCode === "pdf_images_password_invalid" && <div className="pdf-images-password"><div><strong>{t("passwordProtectedPdf")}</strong><small>{t("pdfImagesPasswordHint")}</small></div><label><input type="password" autoComplete="off" value={password} placeholder={t("pdfPassword")} onChange={(event) => setPassword(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void unlockPdf(); }}/><button className="secondary-button" disabled={!password} onClick={() => void unlockPdf()}>{t("unlockPdf")}</button></label></div>}</>}</section>
+    <section className="pdf-images-settings">
+      <div className="compress-panel pdf-images-pages"><div><h2>{t("pagesToConvert")}</h2><p>{t("pagesToConvertHint")}</p></div><div className="pdf-images-choice-grid">{pageModes.map((option) => <button key={option.id} className={pageMode === option.id ? "active" : ""} onClick={() => { setPageMode(option.id); setNotice(null); }}><strong>{t(option.key)}</strong><small>{t(option.hint)}</small></button>)}</div>{pageMode === "current" && <label className="pdf-images-number-field"><span>{t("currentPageNumber")}</span><input type="number" min="1" max={file?.pages} value={currentPage} onChange={(event) => { setCurrentPage(event.target.value); setNotice(null); }}/></label>}{pageMode === "custom" && <label className="pdf-images-custom-pages"><span>{t("customPages")}</span><input dir="ltr" value={customPages} placeholder="1, 3, 5-8" onChange={(event) => { setCustomPages(event.target.value); setNotice(null); }}/><small>{t("customPagesInputHint")}</small></label>}</div>
+      <div className="compress-panel pdf-images-output-format"><div><h2>{t("outputFormat")}</h2><p>{t("pdfImagesFormatHint")}</p></div><div className="pdf-images-format-buttons">{(["jpg", "png", "webp"] as PdfImagesFormat[]).map((option) => <button key={option} className={format === option ? "active" : ""} onClick={() => { setFormat(option); if (option !== "png") setTransparent(false); setNotice(null); }}>{option.toUpperCase()}</button>)}</div>{format !== "png" && <div className="pdf-images-quality"><div><strong>{t("quality")}</strong><b>{quality}</b></div><input type="range" min="10" max="100" value={quality} onChange={(event) => { setQuality(Number(event.target.value)); setNotice(null); }}/><small>{t("pdfImagesQualityHint")}</small></div>}<label className={`pdf-images-transparent ${format !== "png" ? "disabled" : ""}`}><input type="checkbox" checked={transparent} disabled={format !== "png"} onChange={(event) => setTransparent(event.target.checked)}/><span><strong>{t("transparentBackground")}</strong><small>{format === "png" ? t("transparentBackgroundHint") : t("transparentPngOnly")}</small></span></label></div>
+    </section>
+    <section className="compress-panel pdf-images-resolution"><div><h2>{t("resolution")}</h2><p>{t("resolutionHint")}</p></div><div className="pdf-images-resolution-buttons">{resolutions.map((option) => <button key={option.id} className={resolution === option.id ? "active" : ""} onClick={() => { setResolution(option.id); setNotice(null); }}>{option.label}</button>)}</div>{resolution === "custom" && <label><span>{t("customDpi")}</span><div><input type="number" min="1" value={customDpi} onChange={(event) => { setCustomDpi(event.target.value); setNotice(null); }}/><b>DPI</b></div></label>}</section>
+    <section className="compress-panel pdf-images-destination"><div><h2>{t("destinationFolder")}</h2><p>{t("pdfImagesDestinationHint")}</p></div><div className="pdf-destination"><MapPin size={17}/><span><small>{t("destinationFolder")}</small><strong title={destination ?? ""}>{destination ?? t("sameFolderAsPdf")}</strong></span><button className="secondary-button" onClick={() => void chooseDestination()}><FolderOpen size={15}/>{t("chooseFolder")}</button></div></section>
+    <section className={`compress-panel pdf-images-preview ${validationError ? "invalid" : ""}`}><div className="pdf-images-preview-icon"><Layers3 size={24}/></div><div><h2>{t("conversionPreview")}</h2><p>{validationError ?? t("pdfImagesWillCreate", { count: preview.count })}</p></div><strong>{preview.count}</strong><span>{t("images")}</span></section>
+    {isConverting && <section className="compress-panel split-progress pdf-images-progress"><div><span><strong>{t("renderingPdfPages")}</strong><small>{t("renderingPage", { page: progress.currentPage || "—" })}: <b dir="ltr">{progress.currentFile}</b></small></span><span>{progress.completed}/{progress.total} · {progress.percent}%</span></div><progress max="100" value={progress.percent}/></section>}
+    {result && <section className="compress-panel pdf-images-results"><div className="pdf-images-results-header"><CheckCircle2 size={24}/><div><h2>{result.failedCount ? t("pdfImagesPartialComplete", { success: result.files.length, failed: result.failedCount }) : t("pdfImagesComplete", { count: result.files.length })}</h2><small title={result.destinationDir}>{result.destinationDir}</small></div><button className="primary-button" disabled={!result.destinationDir} onClick={() => result.destinationDir && void openPath(result.destinationDir)}><FolderOpen size={15}/>{t("openFolder")}</button></div><div className="pdf-images-result-summary"><span><small>{t("pagesConverted")}</small><strong>{result.totalPages}</strong></span><span><small>{t("failedPages")}</small><strong>{result.failedCount}</strong></span><span><small>{t("outputFormat")}</small><strong>{result.format}</strong></span><span><small>{t("resolutionUsed")}</small><strong>{result.dpi} DPI</strong></span><span><small>{t("totalImagesSize")}</small><strong>{bytes(result.totalSize)}</strong></span><span><small>{t("destinationFolder")}</small><strong title={result.destinationDir}>{result.destinationDir}</strong></span></div><div className="pdf-images-result-list">{result.files.map((output) => <div key={output.path}><div className="pdf-images-output-thumb"><FileImage size={16}/><img src={convertFileSrc(output.path)} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }}/></div><span title={output.path}><strong>{output.name}</strong><small>{t("pageNumber", { page: output.page })} · {output.width} × {output.height} · {bytes(output.size)} · {output.format}</small></span><button className="text-button" onClick={() => void previewGeneratedImage(output)}>{t("previewImage")}</button><button className="text-button" onClick={() => void openGeneratedImage(output)}>{t("openImage")}</button><button className="text-button" onClick={() => void showGeneratedImage(output)}>{t("showInFolder")}</button></div>)}{result.failures.map((failure) => <div className="pdf-images-failed-row" key={`${failure.page}-${failure.code}`}><Trash2 size={15}/><span><strong>{t("failedPage", { page: failure.page })}</strong><small>{t(errorKeys[failure.code] ?? "pdfImagesRenderError")}</small></span></div>)}</div></section>}
+    {previewImage && <div className="pdf-image-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewImage(null); }}><section className="pdf-image-preview-modal" role="dialog" aria-modal="true" aria-label={t("previewImage")}><header><div><strong>{previewImage.name}</strong><small>{previewImage.width} × {previewImage.height} · {bytes(previewImage.size)} · {previewImage.format}</small></div><button className="icon-button" aria-label={t("closePreview")} onClick={() => setPreviewImage(null)}><X size={17}/></button></header><div><img src={convertFileSrc(previewImage.path)} alt={previewImage.name} onError={() => { setPreviewImage(null); setOpenImageError(t("previewImageFailed")); }}/></div></section></div>}
+    {openImageError && <div className="page-error">{openImageError}</div>}
+    {notice && <div className={result?.success ? "split-info" : "page-error"}>{notice}</div>}
+    <div className="pdf-main-action"><button className="primary-button" disabled={file?.status !== "ready" || isConverting} onClick={() => void convertPdf()}>{isConverting ? <LoaderCircle className="spin" size={17}/> : <FileImage size={17}/>} {isConverting ? t("renderingPdfPages") : t("convertPdfToImages")}</button></div>
+  </>;
+}
+
 export function PdfToolsPage() {
   const { t, language, setLanguage } = useI18n();
   const [tab, setTab] = useState<Tab>("merge");
@@ -559,7 +801,7 @@ export function PdfToolsPage() {
       <div className="compress-header-actions"><label className="language-select"><span>{language.toUpperCase()}</span><select value={language} onChange={(event) => setLanguage(event.target.value as "en" | "fr" | "ar")} disabled={isMerging}><option value="en">English</option><option value="fr">Français</option><option value="ar">العربية</option></select></label><div className="header-status"><ShieldCheck size={17}/><span>{t("offline")}</span></div></div>
     </header>
     <nav className="pdf-tabs" aria-label={t("pdfToolsTitle")}>{tabs.map((entry) => <button key={entry.id} className={tab === entry.id ? "active" : ""} onClick={() => setTab(entry.id)}>{t(entry.key)}</button>)}</nav>
-    {tab === "split" ? <SplitPdfPanel/> : tab === "organize" ? <OrganizePagesPanel/> : tab === "imagesToPdf" ? <ImagesToPdfPanel/> : tab !== "merge" ? <section className="compress-panel pdf-coming-soon"><Files size={30}/><h2>{t(tabs.find((entry) => entry.id === tab)!.key)}</h2><p>{t("comingSoon")}</p></section> : <>
+    {tab === "split" ? <SplitPdfPanel/> : tab === "organize" ? <OrganizePagesPanel/> : tab === "imagesToPdf" ? <ImagesToPdfPanel/> : tab === "pdfToImages" ? <PdfToImagesPanel/> : tab !== "merge" ? <section className="compress-panel pdf-coming-soon"><Files size={30}/><h2>{t(tabs.find((entry) => entry.id === tab)!.key)}</h2><p>{t("comingSoon")}</p></section> : <>
       <section className="pdf-drop-zone" onClick={() => !isMerging && void choosePdfs()}><div className="compress-drop-icon"><UploadCloud size={28}/></div><div><h2>{t("pdfDropTitle")}</h2><p>{t("pdfDropSubtitle")}</p></div><button className="primary-button" disabled={isMerging} onClick={(event) => { event.stopPropagation(); void choosePdfs(); }}><FilePlus2 size={17}/>{t("addPdfs")}</button></section>
       <section className="compress-panel file-panel pdf-file-panel"><div className="compress-panel-header"><div><h2>{t("selectedPdfs")}</h2><span>{t("pdfCount", { count: items.length })}</span></div>{items.length > 0 && <button className="text-button danger" disabled={isMerging} onClick={() => { setItems([]); setResult(null); }}><Trash2 size={14}/>{t("clearAll")}</button>}</div>
         {!items.length ? <div className="empty-image-list"><Files size={25}/><strong>{t("noPdfs")}</strong><p>{t("noPdfsHint")}</p></div> : <div className="pdf-list"><div className="pdf-list-head"><span></span><span>{t("fileName")}</span><span>{t("fileSize")}</span><span>{t("pages")}</span><span>{t("status")}</span><span>{t("order")}</span><span></span></div>{items.map((item, index) => <div className={`pdf-row ${item.status}`} key={item.path} draggable={!isMerging} onDragStart={() => { dragging.current = item.path; }} onDragOver={(event) => event.preventDefault()} onDrop={() => dropOn(item.path)}><GripVertical size={15}/><span className="pdf-name" title={item.path}>{item.name}{item.status === "failed" && <small>{message(item.errorCode, item.errorMessage)}</small>}</span><span>{bytes(item.size)}</span><span>{item.pages || "—"}</span><span className="status-pill">{t(item.status)}</span><span className="order-buttons"><button aria-label={t("moveUp")} disabled={isMerging || index === 0} onClick={() => move(index, -1)}><ArrowUp size={13}/></button><button aria-label={t("moveDown")} disabled={isMerging || index === items.length - 1} onClick={() => move(index, 1)}><ArrowDown size={13}/></button></span><button className="icon-button remove-button" aria-label={t("removeFile")} disabled={isMerging} onClick={() => setItems((current) => current.filter((entry) => entry.path !== item.path))}><Trash2 size={14}/></button></div>)}</div>}

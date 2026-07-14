@@ -4,6 +4,7 @@ mod images_pdf;
 mod pdf_merge;
 mod pdf_organize;
 mod pdf_split;
+mod pdf_to_images;
 mod resizing;
 
 use compression::{compress_image, inspect_image};
@@ -12,6 +13,7 @@ use images_pdf::images_to_pdf;
 use pdf_merge::{inspect_pdf, merge_pdfs};
 use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
+use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_output};
 use resizing::resize_image;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,7 +31,10 @@ pub fn run() {
             inspect_pdf,
             merge_pdfs,
             organize_pdf,
-            split_pdf
+            split_pdf,
+            inspect_pdf_for_images,
+            pdf_to_images,
+            validate_pdf_image_output
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

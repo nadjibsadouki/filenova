@@ -26,6 +26,7 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
 webp = "0.3"
 lopdf = { version = "0.40", default-features = false }
+pdfium-render = { version = "=0.9.2", default-features = false, features = ["pdfium_7763", "image_025", "thread_safe"] }
 
 [dev-dependencies]
 tempfile = "3"
