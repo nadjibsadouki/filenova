@@ -1,8 +1,10 @@
 mod compression;
 mod conversion;
+mod resizing;
 
 use compression::{compress_image, inspect_image};
 use conversion::{convert_image, inspect_convertible_image};
+use resizing::resize_image;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -13,7 +15,8 @@ pub fn run() {
             inspect_image,
             compress_image,
             inspect_convertible_image,
-            convert_image
+            convert_image,
+            resize_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

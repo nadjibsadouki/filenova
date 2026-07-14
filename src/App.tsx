@@ -4,6 +4,7 @@ import { navigationItems, type PageId } from "./navigation";
 import { HomePage } from "./pages/HomePage";
 import { CompressImagesPage } from "./pages/CompressImagesPage";
 import { ConvertImagesPage } from "./pages/ConvertImagesPage";
+import { ResizeImagesPage } from "./pages/ResizeImagesPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 
 function App() {
@@ -20,6 +21,8 @@ function App() {
           <CompressImagesPage />
         ) : activePage === "convert-images" ? (
           <ConvertImagesPage />
+        ) : activePage === "resize-images" ? (
+          <ResizeImagesPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}
