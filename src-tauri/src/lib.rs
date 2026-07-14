@@ -1,5 +1,6 @@
 mod compression;
 mod conversion;
+mod images_pdf;
 mod pdf_merge;
 mod pdf_organize;
 mod pdf_split;
@@ -7,6 +8,7 @@ mod resizing;
 
 use compression::{compress_image, inspect_image};
 use conversion::{convert_image, inspect_convertible_image};
+use images_pdf::images_to_pdf;
 use pdf_merge::{inspect_pdf, merge_pdfs};
 use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
@@ -22,6 +24,7 @@ pub fn run() {
             compress_image,
             inspect_convertible_image,
             convert_image,
+            images_to_pdf,
             resize_image,
             inspect_pdf,
             merge_pdfs,

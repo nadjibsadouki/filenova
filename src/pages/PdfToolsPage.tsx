@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, FilePlus2, Files, FolderOpen, GripVertical, Layers3, ListOrdered, LoaderCircle, MapPin, RotateCcw, RotateCw, Save, Scissors, ShieldCheck, Trash2, Undo2, UploadCloud } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, FileImage, FilePlus2, Files, FolderOpen, GripVertical, ImagePlus, Images, Layers3, ListOrdered, LoaderCircle, MapPin, RotateCcw, RotateCw, Save, Scissors, ShieldCheck, Trash2, Undo2, UploadCloud } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 
 type Tab = "merge" | "split" | "organize" | "imagesToPdf" | "pdfToImages";
@@ -16,6 +16,10 @@ interface SplitOutput { path: string; name: string; pages: number; size: number;
 interface SplitResult { success: boolean; files: SplitOutput[]; totalPages: number; destinationDir?: string; errorCode?: string; errorMessage?: string; }
 interface SplitProgress { completed: number; total: number; percent: number; currentFile: string; }
 interface OrganizeResult { success: boolean; initialPages: number; finalPages: number; outputPath?: string; newSize?: number; errorCode?: string; errorMessage?: string; }
+interface PdfImageInfo { path: string; name: string; format: string; width: number; height: number; size: number; }
+interface PdfImageItem extends PdfImageInfo { status: ItemStatus; errorCode?: string; errorMessage?: string; }
+interface ImagesPdfResult { success: boolean; imageCount: number; pageCount: number; pageSizeUsed?: string; outputPath?: string; newSize?: number; errorCode?: string; errorMessage?: string; }
+interface ImagesPdfProgress { completed: number; total: number; percent: number; currentFile: string; }
 
 const tabs: { id: Tab; key: TranslationKey }[] = [
   { id: "merge", key: "mergePdfs" }, { id: "split", key: "splitPdf" },
@@ -24,13 +28,19 @@ const tabs: { id: Tab; key: TranslationKey }[] = [
 ];
 const errorKeys: Record<string, TranslationKey> = {
   corrupted_pdf: "pdfCorrupted", not_pdf: "pdfNotPdf", password_protected_pdf: "pdfPasswordProtected",
-  destination_inaccessible: "pdfDestinationInaccessible", read_error: "pdfReadError", write_error: "pdfWriteError",
+  destination_inaccessible: "pdfDestinationInaccessible", read_error: "pdfReadError", write_error: "pdfWriteError", encode_error: "encodeError",
   insufficient_space: "pdfInsufficientSpace", not_enough_pdfs: "pdfNeedTwo", unknown_error: "unknownError",
   split_invalid_pages: "splitInvalidPages", split_page_zero: "splitPageZero", split_range_reversed: "splitRangeReversed",
   split_page_out_of_range: "splitPageOutOfRange", split_invalid_ranges: "splitInvalidRanges",
   split_invalid_n: "splitInvalidN", split_invalid_mode: "splitInvalidMode", split_already_running: "splitAlreadyRunning",
   organize_all_pages_deleted: "organizeNeedsPage", organize_page_out_of_range: "organizeInvalidPage",
   organize_already_running: "organizeAlreadyRunning",
+  invalid_image: "invalidImage", unsupported_conversion_format: "unsupportedConversionFormat",
+  images_pdf_no_images: "imagesPdfNeedImages", images_pdf_invalid_quality: "imagesPdfInvalidQuality",
+  images_pdf_invalid_color: "imagesPdfInvalidColor", images_pdf_invalid_margin: "imagesPdfInvalidMargin",
+  images_pdf_invalid_page_size: "imagesPdfInvalidPageSize", images_pdf_invalid_orientation: "imagesPdfInvalidOrientation",
+  images_pdf_invalid_dimensions: "imagesPdfInvalidDimensions",
+  images_pdf_invalid_fitting: "imagesPdfInvalidFitting", images_pdf_already_running: "imagesPdfAlreadyRunning",
 };
 function bytes(value: number) {
   if (!value) return "0 B";
@@ -341,6 +351,141 @@ function OrganizePagesPanel() {
   </>;
 }
 
+type PdfPageSize = "a4" | "a3" | "letter" | "legal" | "fitImage" | "custom";
+type PdfOrientation = "auto" | "portrait" | "landscape";
+type PdfMargin = "none" | "small" | "medium" | "large" | "custom";
+type PdfImageFitting = "fit" | "fill" | "stretch";
+
+function ImagesToPdfPanel() {
+  const { t } = useI18n();
+  const [items, setItems] = useState<PdfImageItem[]>([]);
+  const [destination, setDestination] = useState<string | null>(null);
+  const [outputName, setOutputName] = useState("images-document");
+  const [pageSize, setPageSize] = useState<PdfPageSize>("a4");
+  const [orientation, setOrientation] = useState<PdfOrientation>("auto");
+  const [margin, setMargin] = useState<PdfMargin>("small");
+  const [fitting, setFitting] = useState<PdfImageFitting>("fit");
+  const [customWidth, setCustomWidth] = useState("210");
+  const [customHeight, setCustomHeight] = useState("297");
+  const [customMargin, setCustomMargin] = useState("10");
+  const [notice, setNotice] = useState<string | null>(null);
+  const [background, setBackground] = useState<"white" | "black" | "custom">("white");
+  const [customBackground, setCustomBackground] = useState("#ffffff");
+  const [quality, setQuality] = useState(90);
+  const [isCreating, setIsCreating] = useState(false);
+  const [progress, setProgress] = useState<ImagesPdfProgress>({ completed: 0, total: 0, percent: 0, currentFile: "" });
+  const [result, setResult] = useState<ImagesPdfResult | null>(null);
+  const draggingImage = useRef<string | null>(null);
+
+  const addPaths = useCallback(async (paths: string[]) => {
+    const unique = paths.filter((path, index) => paths.indexOf(path) === index && !items.some((item) => item.path === path));
+    if (!unique.length) return;
+    if (isCreating) return;
+    setNotice(null); setResult(null);
+    setItems((current) => [...current, ...unique.map((path) => ({ path, name: nameFromPath(path), format: "—", width: 0, height: 0, size: 0, status: "reading" as const }))]);
+    await Promise.all(unique.map(async (path) => {
+      try {
+        const info = await invoke<PdfImageInfo>("inspect_convertible_image", { path });
+        setItems((current) => current.map((item) => item.path === path ? { ...info, status: "ready" } : item));
+      } catch (error) {
+        const parsed = parseError(error);
+        setItems((current) => current.map((item) => item.path === path ? { ...item, status: "failed", errorCode: parsed.code, errorMessage: parsed.message } : item));
+      }
+    }));
+  }, [isCreating, items]);
+
+  useEffect(() => {
+    let cleanup: (() => void) | undefined; let disposed = false;
+    getCurrentWebview().onDragDropEvent((event) => { if (event.payload.type === "drop") void addPaths(event.payload.paths); })
+      .then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
+    return () => { disposed = true; cleanup?.(); };
+  }, [addPaths]);
+
+  useEffect(() => {
+    let cleanup: (() => void) | undefined; let disposed = false;
+    listen<ImagesPdfProgress>("images-pdf-progress", (event) => setProgress(event.payload))
+      .then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
+    return () => { disposed = true; cleanup?.(); };
+  }, []);
+
+  async function chooseImages() {
+    const picked = await open({ multiple: true, directory: false, filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"] }] });
+    if (picked) await addPaths(Array.isArray(picked) ? picked : [picked]);
+  }
+  async function chooseDestination() {
+    const picked = await open({ directory: true, multiple: false });
+    if (typeof picked === "string") setDestination(picked);
+  }
+  function move(index: number, direction: -1 | 1) {
+    const target = index + direction; if (target < 0 || target >= items.length) return;
+    setItems((current) => { const next = [...current]; [next[index], next[target]] = [next[target], next[index]]; return next; });
+    setNotice(null);
+  }
+  function dropOn(targetPath: string) {
+    const sourcePath = draggingImage.current; draggingImage.current = null;
+    if (!sourcePath || sourcePath === targetPath) return;
+    setItems((current) => {
+      const next = [...current]; const from = next.findIndex((item) => item.path === sourcePath);
+      const [entry] = next.splice(from, 1); const to = next.findIndex((item) => item.path === targetPath);
+      next.splice(to, 0, entry); return next;
+    });
+    setNotice(null);
+  }
+  async function createPdf() {
+    if (items.some((item) => item.status === "reading")) { setNotice(t("imagesPdfWaitForImages")); return; }
+    if (items.some((item) => item.status === "failed")) { setNotice(t("imagesPdfRemoveInvalid")); return; }
+    const valid = items.filter((item) => item.status === "ready");
+    if (!valid.length) { setNotice(t("imagesPdfNeedImages")); return; }
+    if (!outputName.trim()) { setNotice(t("imagesPdfNameRequired")); return; }
+    if (pageSize === "custom" && (!(Number(customWidth) > 0) || !(Number(customHeight) > 0))) { setNotice(t("imagesPdfInvalidPageSize")); return; }
+    if (margin === "custom" && (!(Number(customMargin) >= 0) || customMargin.trim() === "")) { setNotice(t("imagesPdfInvalidMargin")); return; }
+    if (quality < 10 || quality > 100) { setNotice(t("imagesPdfInvalidQuality")); return; }
+    if (isCreating) return;
+    setIsCreating(true); setNotice(null); setResult(null);
+    setProgress({ completed: 0, total: valid.length, percent: 0, currentFile: valid[0].name });
+    try {
+      const response = await invoke<ImagesPdfResult>("images_to_pdf", { request: {
+        paths: valid.map((item) => item.path), destinationDir: destination, outputName, pageSize,
+        customWidthMm: Number(customWidth), customHeightMm: Number(customHeight), orientation,
+        margin, customMarginMm: Number(customMargin), fitting,
+        backgroundColor: background === "white" ? "#ffffff" : background === "black" ? "#000000" : customBackground,
+        quality,
+      }});
+      if (response.success) { setResult(response); setProgress((current) => ({ ...current, completed: response.pageCount, total: response.pageCount, percent: 100 })); setNotice(t("imagesPdfComplete")); }
+      else setNotice(response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError") : response.errorMessage ?? t("unknownError"));
+    } catch (error) {
+      const parsed = parseError(error);
+      setNotice(parsed.code ? t(errorKeys[parsed.code] ?? "unknownError") : parsed.message ?? t("unknownError"));
+    } finally { setIsCreating(false); }
+  }
+
+  const pageSizes: { id: PdfPageSize; key: TranslationKey; detail: string }[] = [
+    { id: "a4", key: "pageSizeA4", detail: "210 × 297 mm" }, { id: "a3", key: "pageSizeA3", detail: "297 × 420 mm" },
+    { id: "letter", key: "pageSizeLetter", detail: "8.5 × 11 in" }, { id: "legal", key: "pageSizeLegal", detail: "8.5 × 14 in" },
+    { id: "fitImage", key: "fitToImage", detail: t("onePagePerImage") }, { id: "custom", key: "custom", detail: t("customDimensions") },
+  ];
+  const orientations: { id: PdfOrientation; key: TranslationKey }[] = [{ id: "auto", key: "orientationAuto" }, { id: "portrait", key: "orientationPortrait" }, { id: "landscape", key: "orientationLandscape" }];
+  const margins: { id: PdfMargin; key: TranslationKey }[] = [{ id: "none", key: "marginNone" }, { id: "small", key: "marginSmall" }, { id: "medium", key: "marginMedium" }, { id: "large", key: "marginLarge" }, { id: "custom", key: "custom" }];
+  const fittings: { id: PdfImageFitting; key: TranslationKey; hint: TranslationKey }[] = [{ id: "fit", key: "fitMethod", hint: "imagesPdfFitHint" }, { id: "fill", key: "fillMethod", hint: "imagesPdfFillHint" }, { id: "stretch", key: "stretchMethod", hint: "imagesPdfStretchHint" }];
+
+  return <>
+    <section className="pdf-drop-zone images-pdf-drop" onClick={() => void chooseImages()}><div className="compress-drop-icon"><UploadCloud size={28}/></div><div><h2>{t("imagesPdfDropTitle")}</h2><p>{t("imagesPdfDropSubtitle")}</p></div><button className="primary-button" onClick={(event) => { event.stopPropagation(); void chooseImages(); }}><ImagePlus size={17}/>{t("addImages")}</button></section>
+    <section className="compress-panel images-pdf-list-panel"><div className="compress-panel-header"><div><h2>{t("selectedImages")}</h2><span>{t("imageCount", { count: items.length })}</span></div>{items.length > 0 && <button className="text-button danger" onClick={() => { setItems([]); setNotice(null); }}><Trash2 size={14}/>{t("clearAll")}</button>}</div>
+      {!items.length ? <div className="empty-image-list"><Images size={25}/><strong>{t("noImages")}</strong><p>{t("imagesPdfNoImagesHint")}</p></div> : <div className="images-pdf-list"><div className="images-pdf-list-head"><span></span><span>{t("fileName")}</span><span>{t("format")}</span><span>{t("dimensions")}</span><span>{t("fileSize")}</span><span>{t("order")}</span><span></span></div>{items.map((item, index) => <div key={item.path} className={`images-pdf-row ${item.status}`} draggable onDragStart={() => { draggingImage.current = item.path; }} onDragOver={(event) => event.preventDefault()} onDrop={() => dropOn(item.path)}><div className="images-pdf-thumb"><FileImage size={18}/>{item.status === "ready" && <img src={convertFileSrc(item.path)} alt="" onError={(event) => { event.currentTarget.style.display = "none"; }}/>}<span>{index + 1}</span></div><span className="pdf-name" title={item.path}>{item.name}{item.status === "failed" && <small>{t(errorKeys[item.errorCode ?? "unknown_error"] ?? "unknownError")}</small>}</span><span>{item.format}</span><span>{item.width > 0 ? `${item.width} × ${item.height}` : "—"}</span><span>{bytes(item.size)}</span><span className="order-buttons"><button aria-label={t("moveUp")} disabled={index === 0} onClick={() => move(index, -1)}><ArrowUp size={13}/></button><button aria-label={t("moveDown")} disabled={index === items.length - 1} onClick={() => move(index, 1)}><ArrowDown size={13}/></button></span><button className="icon-button remove-button" aria-label={t("removeFile")} onClick={() => setItems((current) => current.filter((entry) => entry.path !== item.path))}><Trash2 size={14}/></button></div>)}</div>}
+    </section>
+    <section className="images-pdf-settings"><div className="compress-panel images-pdf-page-settings"><div><h2>{t("pageSize")}</h2><p>{t("pageSizeHint")}</p></div><div className="images-pdf-page-sizes">{pageSizes.map((option) => <button key={option.id} className={pageSize === option.id ? "active" : ""} onClick={() => { setPageSize(option.id); setNotice(null); }}><strong>{t(option.key)}</strong><small>{option.detail}</small></button>)}</div>{pageSize === "custom" && <div className="images-pdf-custom-fields"><label><span>{t("width")}</span><div><input type="number" min="1" value={customWidth} onChange={(event) => setCustomWidth(event.target.value)}/><b>mm</b></div></label><span>×</span><label><span>{t("height")}</span><div><input type="number" min="1" value={customHeight} onChange={(event) => setCustomHeight(event.target.value)}/><b>mm</b></div></label></div>}</div>
+      <div className="compress-panel images-pdf-options"><div><h2>{t("pageOptions")}</h2><p>{t("pageOptionsHint")}</p></div><div className="images-pdf-option-group"><strong>{t("orientation")}</strong><div>{orientations.map((option) => <button key={option.id} className={orientation === option.id ? "active" : ""} onClick={() => setOrientation(option.id)}>{t(option.key)}</button>)}</div></div><div className="images-pdf-option-group"><strong>{t("margins")}</strong><div className="margin-options">{margins.map((option) => <button key={option.id} className={margin === option.id ? "active" : ""} onClick={() => setMargin(option.id)}>{t(option.key)}</button>)}</div>{margin === "custom" && <label className="custom-margin"><input type="number" min="0" value={customMargin} onChange={(event) => setCustomMargin(event.target.value)}/><b>mm</b></label>}</div></div>
+    </section>
+    <section className="compress-panel images-pdf-fitting"><div><h2>{t("imageFitting")}</h2><p>{t("imageFittingHint")}</p></div><div>{fittings.map((option) => <button key={option.id} disabled={isCreating} className={fitting === option.id ? "active" : ""} onClick={() => setFitting(option.id)}><strong>{t(option.key)}</strong><small>{t(option.hint)}</small></button>)}</div>{fitting === "stretch" && <div className="images-pdf-stretch-warning">{t("imagesPdfStretchWarning")}</div>}</section>
+    <section className="compress-panel images-pdf-render-options"><div><h2>{t("imageRendering")}</h2><p>{t("imageRenderingHint")}</p></div><div className="images-pdf-background"><strong>{t("pageBackground")}</strong><div><button disabled={isCreating} className={background === "white" ? "active" : ""} onClick={() => setBackground("white")}><i style={{ background: "#fff" }}></i>{t("backgroundWhite")}</button><button disabled={isCreating} className={background === "black" ? "active" : ""} onClick={() => setBackground("black")}><i style={{ background: "#000" }}></i>{t("backgroundBlack")}</button><button disabled={isCreating} className={background === "custom" ? "active" : ""} onClick={() => setBackground("custom")}><i style={{ background: customBackground }}></i>{t("backgroundCustom")}</button></div>{background === "custom" && <label><input type="color" value={customBackground} disabled={isCreating} onChange={(event) => setCustomBackground(event.target.value)}/><code>{customBackground}</code></label>}</div><div className="images-pdf-quality"><div><strong>{t("imageQuality")}</strong><b>{quality}</b></div><input type="range" min="10" max="100" value={quality} disabled={isCreating} onChange={(event) => setQuality(Number(event.target.value))}/><small>{t("imagesPdfQualityHint")}</small></div></section>
+    <section className="compress-panel organize-output images-pdf-output"><div><h2>{t("pdfOutputSettings")}</h2><p>{t("imagesPdfOutputHint")}</p></div><label><span>{t("pdfFileName")}</span><div><input value={outputName} onChange={(event) => { setOutputName(event.target.value); setNotice(null); }}/><b>.pdf</b></div></label><div className="pdf-destination"><MapPin size={17}/><span><small>{t("destinationFolder")}</small><strong title={destination ?? ""}>{destination ?? t("sameFolder")}</strong></span><button className="secondary-button" onClick={() => void chooseDestination()}><FolderOpen size={15}/>{t("chooseFolder")}</button></div></section>
+    {isCreating && <section className="compress-panel split-progress"><div><span><strong>{t("creatingPdf")}</strong><small>{t("processingImage")}: <b dir="ltr">{progress.currentFile}</b></small></span><span>{progress.completed}/{progress.total} · {progress.percent}%</span></div><progress max="100" value={progress.percent}/></section>}
+    {result?.success && result.outputPath && <section className="compress-panel organize-result images-pdf-result"><CheckCircle2 size={26}/><div><h2>{t("imagesPdfComplete")}</h2><div><span><small>{t("imagesAdded")}</small><strong>{result.imageCount}</strong></span><span><small>{t("pagesCreated")}</small><strong>{result.pageCount}</strong></span><span><small>{t("pdfSize")}</small><strong>{bytes(result.newSize ?? 0)}</strong></span><span><small>{t("pageFormatUsed")}</small><strong>{result.pageSizeUsed}</strong></span><span className="organize-result-path"><small>{t("filePath")}</small><strong title={result.outputPath}>{result.outputPath}</strong></span></div></div><aside><button className="secondary-button" onClick={() => void openPath(result.outputPath!)}>{t("openFile")}</button><button className="primary-button" onClick={() => void revealItemInDir(result.outputPath!)}><FolderOpen size={15}/>{t("openFolder")}</button></aside></section>}
+    {notice && <div className={result?.success ? "split-info" : "page-error"}>{notice}</div>}
+    <div className="pdf-main-action"><button className="primary-button" disabled={isCreating || items.some((item) => item.status === "reading")} onClick={() => void createPdf()}>{isCreating ? <LoaderCircle className="spin" size={17}/> : <FileImage size={17}/>} {isCreating ? t("creatingPdf") : t("createPdf")}</button></div>
+  </>;
+}
+
 export function PdfToolsPage() {
   const { t, language, setLanguage } = useI18n();
   const [tab, setTab] = useState<Tab>("merge");
@@ -414,7 +559,7 @@ export function PdfToolsPage() {
       <div className="compress-header-actions"><label className="language-select"><span>{language.toUpperCase()}</span><select value={language} onChange={(event) => setLanguage(event.target.value as "en" | "fr" | "ar")} disabled={isMerging}><option value="en">English</option><option value="fr">Français</option><option value="ar">العربية</option></select></label><div className="header-status"><ShieldCheck size={17}/><span>{t("offline")}</span></div></div>
     </header>
     <nav className="pdf-tabs" aria-label={t("pdfToolsTitle")}>{tabs.map((entry) => <button key={entry.id} className={tab === entry.id ? "active" : ""} onClick={() => setTab(entry.id)}>{t(entry.key)}</button>)}</nav>
-    {tab === "split" ? <SplitPdfPanel/> : tab === "organize" ? <OrganizePagesPanel/> : tab !== "merge" ? <section className="compress-panel pdf-coming-soon"><Files size={30}/><h2>{t(tabs.find((entry) => entry.id === tab)!.key)}</h2><p>{t("comingSoon")}</p></section> : <>
+    {tab === "split" ? <SplitPdfPanel/> : tab === "organize" ? <OrganizePagesPanel/> : tab === "imagesToPdf" ? <ImagesToPdfPanel/> : tab !== "merge" ? <section className="compress-panel pdf-coming-soon"><Files size={30}/><h2>{t(tabs.find((entry) => entry.id === tab)!.key)}</h2><p>{t("comingSoon")}</p></section> : <>
       <section className="pdf-drop-zone" onClick={() => !isMerging && void choosePdfs()}><div className="compress-drop-icon"><UploadCloud size={28}/></div><div><h2>{t("pdfDropTitle")}</h2><p>{t("pdfDropSubtitle")}</p></div><button className="primary-button" disabled={isMerging} onClick={(event) => { event.stopPropagation(); void choosePdfs(); }}><FilePlus2 size={17}/>{t("addPdfs")}</button></section>
       <section className="compress-panel file-panel pdf-file-panel"><div className="compress-panel-header"><div><h2>{t("selectedPdfs")}</h2><span>{t("pdfCount", { count: items.length })}</span></div>{items.length > 0 && <button className="text-button danger" disabled={isMerging} onClick={() => { setItems([]); setResult(null); }}><Trash2 size={14}/>{t("clearAll")}</button>}</div>
         {!items.length ? <div className="empty-image-list"><Files size={25}/><strong>{t("noPdfs")}</strong><p>{t("noPdfsHint")}</p></div> : <div className="pdf-list"><div className="pdf-list-head"><span></span><span>{t("fileName")}</span><span>{t("fileSize")}</span><span>{t("pages")}</span><span>{t("status")}</span><span>{t("order")}</span><span></span></div>{items.map((item, index) => <div className={`pdf-row ${item.status}`} key={item.path} draggable={!isMerging} onDragStart={() => { dragging.current = item.path; }} onDragOver={(event) => event.preventDefault()} onDrop={() => dropOn(item.path)}><GripVertical size={15}/><span className="pdf-name" title={item.path}>{item.name}{item.status === "failed" && <small>{message(item.errorCode, item.errorMessage)}</small>}</span><span>{bytes(item.size)}</span><span>{item.pages || "—"}</span><span className="status-pill">{t(item.status)}</span><span className="order-buttons"><button aria-label={t("moveUp")} disabled={isMerging || index === 0} onClick={() => move(index, -1)}><ArrowUp size={13}/></button><button aria-label={t("moveDown")} disabled={isMerging || index === items.length - 1} onClick={() => move(index, 1)}><ArrowDown size={13}/></button></span><button className="icon-button remove-button" aria-label={t("removeFile")} disabled={isMerging} onClick={() => setItems((current) => current.filter((entry) => entry.path !== item.path))}><Trash2 size={14}/></button></div>)}</div>}
