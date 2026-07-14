@@ -3,6 +3,7 @@ import { Sidebar } from "./components/Sidebar";
 import { navigationItems, type PageId } from "./navigation";
 import { HomePage } from "./pages/HomePage";
 import { CompressImagesPage } from "./pages/CompressImagesPage";
+import { ConvertImagesPage } from "./pages/ConvertImagesPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 
 function App() {
@@ -17,6 +18,8 @@ function App() {
           <HomePage onNavigate={setActivePage} />
         ) : activePage === "compress-images" ? (
           <CompressImagesPage />
+        ) : activePage === "convert-images" ? (
+          <ConvertImagesPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}
