@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { ArrowDown, ArrowUp, CheckCircle2, FilePlus2, Files, FolderOpen, GripVertical, Layers3, ListOrdered, LoaderCircle, MapPin, Scissors, ShieldCheck, Trash2, UploadCloud } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, FilePlus2, Files, FolderOpen, GripVertical, Layers3, ListOrdered, LoaderCircle, MapPin, RotateCcw, RotateCw, Save, Scissors, ShieldCheck, Trash2, Undo2, UploadCloud } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 
 type Tab = "merge" | "split" | "organize" | "imagesToPdf" | "pdfToImages";
@@ -15,6 +15,7 @@ interface MergeResult { success: boolean; pdfCount: number; totalPages: number; 
 interface SplitOutput { path: string; name: string; pages: number; size: number; }
 interface SplitResult { success: boolean; files: SplitOutput[]; totalPages: number; destinationDir?: string; errorCode?: string; errorMessage?: string; }
 interface SplitProgress { completed: number; total: number; percent: number; currentFile: string; }
+interface OrganizeResult { success: boolean; initialPages: number; finalPages: number; outputPath?: string; newSize?: number; errorCode?: string; errorMessage?: string; }
 
 const tabs: { id: Tab; key: TranslationKey }[] = [
   { id: "merge", key: "mergePdfs" }, { id: "split", key: "splitPdf" },
@@ -28,6 +29,8 @@ const errorKeys: Record<string, TranslationKey> = {
   split_invalid_pages: "splitInvalidPages", split_page_zero: "splitPageZero", split_range_reversed: "splitRangeReversed",
   split_page_out_of_range: "splitPageOutOfRange", split_invalid_ranges: "splitInvalidRanges",
   split_invalid_n: "splitInvalidN", split_invalid_mode: "splitInvalidMode", split_already_running: "splitAlreadyRunning",
+  organize_all_pages_deleted: "organizeNeedsPage", organize_page_out_of_range: "organizeInvalidPage",
+  organize_already_running: "organizeAlreadyRunning",
 };
 function bytes(value: number) {
   if (!value) return "0 B";
@@ -202,6 +205,142 @@ function SplitPdfPanel() {
   </>;
 }
 
+interface OrganizePageItem { id: number; originalPage: number; rotation: number; }
+
+function moveSelectedPages(pages: OrganizePageItem[], selected: Set<number>, direction: -1 | 1) {
+  const next = [...pages];
+  if (direction < 0) {
+    for (let index = 1; index < next.length; index += 1) {
+      if (selected.has(next[index].id) && !selected.has(next[index - 1].id)) [next[index - 1], next[index]] = [next[index], next[index - 1]];
+    }
+  } else {
+    for (let index = next.length - 2; index >= 0; index -= 1) {
+      if (selected.has(next[index].id) && !selected.has(next[index + 1].id)) [next[index], next[index + 1]] = [next[index + 1], next[index]];
+    }
+  }
+  return next;
+}
+
+function OrganizePagesPanel() {
+  const { t } = useI18n();
+  const [file, setFile] = useState<PdfItem | null>(null);
+  const [pages, setPages] = useState<OrganizePageItem[]>([]);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [destination, setDestination] = useState<string | null>(null);
+  const [outputName, setOutputName] = useState("organized-document");
+  const [notice, setNotice] = useState<string | null>(null);
+  const draggingPage = useRef<number | null>(null);
+  const nextPageId = useRef(1);
+  const [isOrganizing, setIsOrganizing] = useState(false);
+  const [result, setResult] = useState<OrganizeResult | null>(null);
+
+  const addPath = useCallback(async (path: string) => {
+    if (isOrganizing) return;
+    setNotice(null); setResult(null); setSelected(new Set()); setPages([]);
+    setFile({ path, name: nameFromPath(path), size: 0, pages: 0, status: "reading" });
+    try {
+      const info = await invoke<PdfInfo>("inspect_pdf", { path });
+      setFile({ ...info, status: "ready" });
+      setPages(Array.from({ length: info.pages }, (_, index) => ({ id: index + 1, originalPage: index + 1, rotation: 0 })));
+      nextPageId.current = info.pages + 1;
+      setOutputName(`${splitStem(info.name)}-organized`);
+    } catch (error) {
+      const parsed = parseError(error);
+      setFile((current) => current?.path === path ? { ...current, status: "failed", errorCode: parsed.code, errorMessage: parsed.message } : current);
+    }
+  }, [isOrganizing]);
+
+  useEffect(() => {
+    let cleanup: (() => void) | undefined; let disposed = false;
+    getCurrentWebview().onDragDropEvent((event) => { if (event.payload.type === "drop" && event.payload.paths[0]) void addPath(event.payload.paths[0]); })
+      .then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
+    return () => { disposed = true; cleanup?.(); };
+  }, [addPath]);
+
+  async function choosePdf() {
+    const picked = await open({ multiple: false, directory: false, filters: [{ name: "PDF", extensions: ["pdf"] }] });
+    if (typeof picked === "string") await addPath(picked);
+  }
+  async function chooseDestination() {
+    const picked = await open({ directory: true, multiple: false });
+    if (typeof picked === "string") setDestination(picked);
+  }
+  function togglePage(id: number) {
+    setSelected((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  }
+  function dropPage(targetId: number) {
+    const sourceId = draggingPage.current; draggingPage.current = null;
+    if (sourceId === null || sourceId === targetId) return;
+    setPages((current) => {
+      const next = [...current]; const from = next.findIndex((page) => page.id === sourceId);
+      const [entry] = next.splice(from, 1); const to = next.findIndex((page) => page.id === targetId);
+      next.splice(to, 0, entry); return next;
+    });
+    setNotice(null); setResult(null);
+  }
+  function moveSelection(direction: -1 | 1) {
+    setPages((current) => moveSelectedPages(current, selected, direction));
+    setNotice(null); setResult(null);
+  }
+  function rotate(delta: number) {
+    if (!selected.size) { setNotice(t("organizeSelectPages")); return; }
+    setPages((current) => current.map((page) => selected.has(page.id) ? { ...page, rotation: (page.rotation + delta + 360) % 360 } : page));
+    setNotice(null); setResult(null);
+  }
+  function removeSelected() {
+    if (!selected.size) { setNotice(t("organizeSelectPages")); return; }
+    setPages((current) => current.filter((page) => !selected.has(page.id))); setSelected(new Set()); setNotice(null); setResult(null);
+  }
+  function duplicateSelected() {
+    if (!selected.size) { setNotice(t("organizeSelectPages")); return; }
+    const duplicated = new Set<number>();
+    setPages((current) => current.flatMap((page) => {
+      if (!selected.has(page.id)) return [page];
+      const copy = { ...page, id: nextPageId.current++ };
+      duplicated.add(copy.id);
+      return [page, copy];
+    }));
+    setSelected(duplicated); setNotice(null); setResult(null);
+  }
+  function resetPages() {
+    if (!file || file.status !== "ready") return;
+    setPages(Array.from({ length: file.pages }, (_, index) => ({ id: index + 1, originalPage: index + 1, rotation: 0 })));
+    nextPageId.current = file.pages + 1;
+    setSelected(new Set()); setNotice(null); setResult(null);
+  }
+  async function saveOrganizedPdf() {
+    if (!file || file.status !== "ready") { setNotice(t("organizeAddValidPdf")); return; }
+    if (!pages.length) { setNotice(t("organizeNeedsPage")); return; }
+    if (!outputName.trim()) { setNotice(t("organizeNameRequired")); return; }
+    if (isOrganizing) return;
+    setIsOrganizing(true); setNotice(null); setResult(null);
+    try {
+      const response = await invoke<OrganizeResult>("organize_pdf", { request: {
+        path: file.path, destinationDir: destination, outputName,
+        pages: pages.map((page) => ({ sourcePage: page.originalPage, rotation: page.rotation })),
+      }});
+      if (response.success) { setResult(response); setNotice(t("organizeComplete")); }
+      else setNotice(response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError") : response.errorMessage ?? t("unknownError"));
+    } catch (error) {
+      const parsed = parseError(error);
+      setNotice(parsed.code ? t(errorKeys[parsed.code] ?? "unknownError") : parsed.message ?? t("unknownError"));
+    } finally { setIsOrganizing(false); }
+  }
+
+  const fileError = file?.status === "failed" ? t(errorKeys[file.errorCode ?? "unknown_error"] ?? "unknownError") : null;
+  return <>
+    <section className="pdf-drop-zone organize-drop-zone" onClick={() => !isOrganizing && void choosePdf()}><div className="compress-drop-icon"><UploadCloud size={28}/></div><div><h2>{t("organizeDropTitle")}</h2><p>{t("organizeDropSubtitle")}</p></div><button className="primary-button" disabled={isOrganizing} onClick={(event) => { event.stopPropagation(); void choosePdf(); }}><FilePlus2 size={17}/>{file ? t("replacePdf") : t("addPdf")}</button></section>
+    <section className="compress-panel organize-file-panel"><div className="compress-panel-header"><div><h2>{t("selectedPdf")}</h2><span>{t("singlePdfOnly")}</span></div></div>{!file ? <div className="empty-image-list"><Files size={25}/><strong>{t("noPdfSelected")}</strong><p>{t("organizeAddValidPdf")}</p></div> : <div className={`split-file-row ${file.status}`}><Files size={24}/><span className="pdf-name" title={file.path}>{file.name}{fileError && <small>{fileError}</small>}</span><span><small>{t("fileSize")}</small><strong>{bytes(file.size)}</strong></span><span><small>{t("totalPages")}</small><strong>{file.pages || "—"}</strong></span><button className="secondary-button" disabled={isOrganizing} onClick={() => void choosePdf()}>{t("replacePdf")}</button><button className="icon-button remove-button" aria-label={t("removeFile")} disabled={isOrganizing} onClick={() => { setFile(null); setPages([]); setSelected(new Set()); setNotice(null); setResult(null); }}><Trash2 size={14}/></button></div>}</section>
+    {file?.status === "ready" && <section className="compress-panel organize-workspace"><div className="organize-toolbar"><div><strong>{t("organizePagesSelected", { selected: selected.size, total: pages.length })}</strong><small>{t("organizeDragHint")}</small></div><div className="organize-actions"><button disabled={!selected.size || isOrganizing} onClick={() => moveSelection(-1)}><ArrowLeft size={14}/>{t("moveLeft")}</button><button disabled={!selected.size || isOrganizing} onClick={() => moveSelection(1)}><ArrowRight size={14}/>{t("moveRight")}</button><i></i><button disabled={!selected.size || isOrganizing} onClick={() => rotate(-90)}><RotateCcw size={14}/>{t("rotateLeft")}</button><button disabled={!selected.size || isOrganizing} onClick={() => rotate(90)}><RotateCw size={14}/>{t("rotateRight")}</button><button disabled={!selected.size || isOrganizing} onClick={() => rotate(180)}><RotateCw size={14}/>{t("rotate180")}</button><button disabled={!selected.size || isOrganizing} onClick={duplicateSelected}><FilePlus2 size={14}/>{t("duplicatePage")}</button><button className="danger" disabled={!selected.size || isOrganizing} onClick={removeSelected}><Trash2 size={14}/>{t("deletePages")}</button><button disabled={isOrganizing} onClick={resetPages}><Undo2 size={14}/>{t("reset")}</button></div></div>
+      {!pages.length ? <div className="organize-empty"><Trash2 size={24}/><strong>{t("allPagesDeleted")}</strong><button className="secondary-button" disabled={isOrganizing} onClick={resetPages}>{t("reset")}</button></div> : <div className="organize-page-grid">{pages.map((page, index) => <article key={page.id} className={`organize-page-card ${selected.has(page.id) ? "selected" : ""}`} draggable={!isOrganizing} onDragStart={() => { draggingPage.current = page.id; }} onDragOver={(event) => event.preventDefault()} onDrop={() => dropPage(page.id)} onClick={() => !isOrganizing && togglePage(page.id)}><div className="organize-page-position">{index + 1}</div><div className="organize-page-paper"><div style={{ transform: `rotate(${page.rotation}deg)` }}><span>{page.originalPage}</span><b></b><b></b><b></b></div></div><label onClick={(event) => event.stopPropagation()}><input type="checkbox" disabled={isOrganizing} checked={selected.has(page.id)} onChange={() => togglePage(page.id)}/><span>{t("pageNumber", { page: page.originalPage })}</span></label>{page.rotation !== 0 && <small>{page.rotation}°</small>}<GripVertical size={14}/></article>)}</div>}
+    </section>}
+    <section className="compress-panel organize-output"><div><h2>{t("organizeOutput")}</h2><p>{t("organizeOutputHint")}</p></div><label><span>{t("finalFileName")}</span><div><input value={outputName} disabled={isOrganizing} onChange={(event) => { setOutputName(event.target.value); setNotice(null); setResult(null); }}/><b>.pdf</b></div></label><div className="pdf-destination"><MapPin size={17}/><span><small>{t("destinationFolder")}</small><strong title={destination ?? ""}>{destination ?? t("sameFolder")}</strong></span><button className="secondary-button" disabled={isOrganizing} onClick={() => void chooseDestination()}><FolderOpen size={15}/>{t("chooseFolder")}</button></div></section>
+    {result?.success && result.outputPath && <section className="compress-panel organize-result"><CheckCircle2 size={26}/><div><h2>{t("organizeComplete")}</h2><div><span><small>{t("initialPageCount")}</small><strong>{result.initialPages}</strong></span><span><small>{t("finalPageCount")}</small><strong>{result.finalPages}</strong></span><span><small>{t("createdFileSize")}</small><strong>{bytes(result.newSize ?? 0)}</strong></span><span className="organize-result-path"><small>{t("createdFile")}</small><strong title={result.outputPath}>{result.outputPath}</strong></span></div></div><aside><button className="secondary-button" onClick={() => void openPath(result.outputPath!)}>{t("openFile")}</button><button className="primary-button" onClick={() => void revealItemInDir(result.outputPath!)}><FolderOpen size={15}/>{t("openFolder")}</button></aside></section>}
+    {notice && <div className={result?.success ? "split-info" : "page-error"}>{notice}</div>}
+    <div className="pdf-main-action"><button className="primary-button" disabled={file?.status === "reading" || isOrganizing} onClick={() => void saveOrganizedPdf()}>{isOrganizing ? <LoaderCircle className="spin" size={17}/> : <Save size={17}/>} {isOrganizing ? t("organizingPdf") : t("saveOrganizedPdf")}</button></div>
+  </>;
+}
+
 export function PdfToolsPage() {
   const { t, language, setLanguage } = useI18n();
   const [tab, setTab] = useState<Tab>("merge");
@@ -275,7 +414,7 @@ export function PdfToolsPage() {
       <div className="compress-header-actions"><label className="language-select"><span>{language.toUpperCase()}</span><select value={language} onChange={(event) => setLanguage(event.target.value as "en" | "fr" | "ar")} disabled={isMerging}><option value="en">English</option><option value="fr">Français</option><option value="ar">العربية</option></select></label><div className="header-status"><ShieldCheck size={17}/><span>{t("offline")}</span></div></div>
     </header>
     <nav className="pdf-tabs" aria-label={t("pdfToolsTitle")}>{tabs.map((entry) => <button key={entry.id} className={tab === entry.id ? "active" : ""} onClick={() => setTab(entry.id)}>{t(entry.key)}</button>)}</nav>
-    {tab === "split" ? <SplitPdfPanel/> : tab !== "merge" ? <section className="compress-panel pdf-coming-soon"><Files size={30}/><h2>{t(tabs.find((entry) => entry.id === tab)!.key)}</h2><p>{t("comingSoon")}</p></section> : <>
+    {tab === "split" ? <SplitPdfPanel/> : tab === "organize" ? <OrganizePagesPanel/> : tab !== "merge" ? <section className="compress-panel pdf-coming-soon"><Files size={30}/><h2>{t(tabs.find((entry) => entry.id === tab)!.key)}</h2><p>{t("comingSoon")}</p></section> : <>
       <section className="pdf-drop-zone" onClick={() => !isMerging && void choosePdfs()}><div className="compress-drop-icon"><UploadCloud size={28}/></div><div><h2>{t("pdfDropTitle")}</h2><p>{t("pdfDropSubtitle")}</p></div><button className="primary-button" disabled={isMerging} onClick={(event) => { event.stopPropagation(); void choosePdfs(); }}><FilePlus2 size={17}/>{t("addPdfs")}</button></section>
       <section className="compress-panel file-panel pdf-file-panel"><div className="compress-panel-header"><div><h2>{t("selectedPdfs")}</h2><span>{t("pdfCount", { count: items.length })}</span></div>{items.length > 0 && <button className="text-button danger" disabled={isMerging} onClick={() => { setItems([]); setResult(null); }}><Trash2 size={14}/>{t("clearAll")}</button>}</div>
         {!items.length ? <div className="empty-image-list"><Files size={25}/><strong>{t("noPdfs")}</strong><p>{t("noPdfsHint")}</p></div> : <div className="pdf-list"><div className="pdf-list-head"><span></span><span>{t("fileName")}</span><span>{t("fileSize")}</span><span>{t("pages")}</span><span>{t("status")}</span><span>{t("order")}</span><span></span></div>{items.map((item, index) => <div className={`pdf-row ${item.status}`} key={item.path} draggable={!isMerging} onDragStart={() => { dragging.current = item.path; }} onDragOver={(event) => event.preventDefault()} onDrop={() => dropOn(item.path)}><GripVertical size={15}/><span className="pdf-name" title={item.path}>{item.name}{item.status === "failed" && <small>{message(item.errorCode, item.errorMessage)}</small>}</span><span>{bytes(item.size)}</span><span>{item.pages || "—"}</span><span className="status-pill">{t(item.status)}</span><span className="order-buttons"><button aria-label={t("moveUp")} disabled={isMerging || index === 0} onClick={() => move(index, -1)}><ArrowUp size={13}/></button><button aria-label={t("moveDown")} disabled={isMerging || index === items.length - 1} onClick={() => move(index, 1)}><ArrowDown size={13}/></button></span><button className="icon-button remove-button" aria-label={t("removeFile")} disabled={isMerging} onClick={() => setItems((current) => current.filter((entry) => entry.path !== item.path))}><Trash2 size={14}/></button></div>)}</div>}
