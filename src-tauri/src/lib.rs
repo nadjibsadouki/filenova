@@ -1,9 +1,11 @@
 mod compression;
 mod conversion;
+mod pdf_merge;
 mod resizing;
 
 use compression::{compress_image, inspect_image};
 use conversion::{convert_image, inspect_convertible_image};
+use pdf_merge::{inspect_pdf, merge_pdfs};
 use resizing::resize_image;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -16,7 +18,9 @@ pub fn run() {
             compress_image,
             inspect_convertible_image,
             convert_image,
-            resize_image
+            resize_image,
+            inspect_pdf,
+            merge_pdfs
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

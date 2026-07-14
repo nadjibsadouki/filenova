@@ -5,6 +5,7 @@ import { HomePage } from "./pages/HomePage";
 import { CompressImagesPage } from "./pages/CompressImagesPage";
 import { ConvertImagesPage } from "./pages/ConvertImagesPage";
 import { ResizeImagesPage } from "./pages/ResizeImagesPage";
+import { PdfToolsPage } from "./pages/PdfToolsPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 
 function App() {
@@ -23,6 +24,8 @@ function App() {
           <ConvertImagesPage />
         ) : activePage === "resize-images" ? (
           <ResizeImagesPage />
+        ) : activePage === "pdf-tools" ? (
+          <PdfToolsPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}

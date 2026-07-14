@@ -181,4 +181,11 @@ export const en = {
   presetCover: "Cover",
   presetProfileBanner: "Profile Banner",
   presetHeader: "Header",
+  pdfModuleLabel: "PDF TOOLS", pdfToolsTitle: "PDF Tools", pdfToolsSubtitle: "Work with PDF documents privately, directly on your device.",
+  mergePdfs: "Merge PDFs", splitPdf: "Split PDF", organizePages: "Organize Pages", imagesToPdf: "Images to PDF", pdfToImages: "PDF to Images", comingSoon: "Coming soon",
+  pdfDropTitle: "Drop PDFs to merge", pdfDropSubtitle: "Select two or more PDF files — processing stays on your device", addPdfs: "Add PDFs", selectedPdfs: "Selected PDFs", pdfCount: "{count} PDF(s)", noPdfs: "No PDFs selected", noPdfsHint: "Add at least two PDF files to start.",
+  fileName: "File name", destinationFolder: "Destination folder", sameFolder: "Same folder as the first PDF",
+  pages: "Pages", order: "Order", moveUp: "Move up", moveDown: "Move down", removeFile: "Remove file",
+  pdfOutputSettings: "Output settings", pdfOutputHint: "Choose where the merged document will be created and give it a name.", finalFileName: "Final file name", mergingPdfs: "Merging PDFs…", mergeComplete: "PDFs merged successfully", pdfsMerged: "PDFs merged", totalPages: "Total pages", createdFileSize: "Created file size", destinationPath: "Destination path", openFile: "Open File",
+  pdfCorrupted: "This PDF is corrupted or cannot be read.", pdfNotPdf: "This file is not a PDF.", pdfPasswordProtected: "This PDF is password protected and cannot be merged.", pdfDestinationInaccessible: "The destination folder is inaccessible.", pdfReadError: "The PDF could not be read.", pdfWriteError: "The merged PDF could not be written.", pdfInsufficientSpace: "There is not enough disk space to create the merged PDF.", pdfNeedTwo: "Select at least two valid PDF files.",
 } as const;
