@@ -1208,8 +1208,11 @@ button { color: inherit; }
 .trim-plan-copy, .trim-plan-encode { margin: 10px 0 0; padding: 8px 10px; border-radius: 7px; font-size: 8px; font-weight: 800; }
 .trim-plan-copy { color: #267153; background: #eaf8f1; }
 .trim-plan-encode { color: #8b6230; background: #fff6e8; }
+.trim-keyframe-warning { display: flex; align-items: center; gap: 6px; margin: 9px 0 0; color: #7d6238; font-size: 8px; line-height: 1.4; }
 .trim-output-name { margin-top: 12px; padding: 13px; }
 .trim-video-button { margin-top: 12px; }
+.trim-progress, .trim-result, .trim-run-error { margin-top: 12px; }
+.trim-result { padding: 13px; }
 [dir="rtl"] .trim-video-page .video-section-title, [dir="rtl"] .trim-video-source, [dir="rtl"] .trim-plan-panel { text-align: right; }
 @media (max-width: 1050px) { .trim-source-metadata { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 820px) { .video-drop-zone { flex-direction: column; text-align: center; } .video-settings-grid { grid-template-columns: 1fr; } .video-file-row { grid-template-columns: 110px minmax(0, 1fr); } .video-thumbnail { width: 110px; } .video-remove-button { grid-column: 2; justify-self: end; } }

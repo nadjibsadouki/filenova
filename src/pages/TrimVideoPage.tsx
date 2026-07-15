@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   AlertCircle,
+  Ban,
   Check,
+  CheckCircle2,
   Clapperboard,
   Clock3,
   FileVideo2,
@@ -16,6 +20,8 @@ import {
   Settings2,
   Trash2,
   UploadCloud,
+  Video,
+  X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 
@@ -35,7 +41,60 @@ interface VideoInfo {
   audioCodec: string | null;
 }
 
+interface FastTrimProgress {
+  path: string;
+  name: string;
+  processedSeconds: number;
+  durationSeconds: number;
+  percent: number;
+}
+
+interface FastTrimResult {
+  requestedStartSeconds: number;
+  requestedEndSeconds: number;
+  requestedDurationSeconds: number;
+  detectedActualStartSeconds: number;
+  finalDurationSeconds: number;
+  keyframeOffsetSeconds: number;
+  finalFormat: string;
+  finalVideoCodec: string;
+  finalAudioCodec: string | null;
+  originalSize: number;
+  finalSize: number;
+  processingDurationSeconds: number;
+  outputPath: string;
+  outputName: string;
+}
+
 const extensions = ["mp4", "mov", "mkv", "avi", "webm", "m4v"];
+const fastTrimErrors: Record<string, TranslationKey> = {
+  invalid_trim_selection: "trimInvalidSelection",
+  container_incompatible: "trimContainerIncompatible",
+  fast_cut_video_incompatible: "trimFastVideoIncompatible",
+  fast_cut_audio_incompatible: "trimFastAudioIncompatible",
+  ffmpeg_unavailable: "ffmpegUnavailable",
+  ffprobe_unavailable: "ffprobeUnavailable",
+  destination_inaccessible: "videoDestinationInaccessible",
+  disk_full: "videoDiskFull",
+  trim_cancelled: "trimCancelled",
+  output_empty: "videoOutputEmpty",
+  output_invalid: "videoOutputInvalid",
+  output_duration_invalid: "trimOutputDurationInvalid",
+  invalid_output_name: "trimInvalidOutputName",
+  trim_busy: "trimBusy",
+  trim_failed: "trimFailed",
+};
+
+function errorCode(error: unknown) {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    return String((error as { code: unknown }).code);
+  }
+  try {
+    return errorCode(JSON.parse(String(error)));
+  } catch {
+    return "trim_failed";
+  }
+}
 
 function formatBytes(bytes: number) {
   const units = ["B", "KB", "MB", "GB"];
@@ -70,6 +129,14 @@ function copyCompatible(format: OutputFormat, codec: string) {
   return value !== "UNKNOWN";
 }
 
+function audioCopyCompatible(format: string, codec: string | null) {
+  if (!codec) return true;
+  const value = codec.toUpperCase().replace(/-/g, "");
+  if (format === "webm") return ["OPUS", "VORBIS"].includes(value);
+  if (["mp4", "m4v", "mov"].includes(format)) return ["AAC", "MP3", "ALAC", "OPUS"].includes(value);
+  return ["mkv", "avi"].includes(format) && value !== "UNKNOWN";
+}
+
 function defaultOutputName(name: string) {
   const stem = name.replace(/\.[^.]+$/, "") || "video";
   return `${stem}-trimmed`;
@@ -94,6 +161,11 @@ export function TrimVideoPage() {
   const [removeAudio, setRemoveAudio] = useState(false);
   const [destination, setDestination] = useState<string | null>(null);
   const [outputName, setOutputName] = useState("");
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState<FastTrimProgress | null>(null);
+  const [result, setResult] = useState<FastTrimResult | null>(null);
+  const [runError, setRunError] = useState<TranslationKey | null>(null);
+  const [previewResult, setPreviewResult] = useState(false);
   const player = useRef<HTMLVideoElement>(null);
   const previewing = useRef(false);
 
@@ -102,6 +174,8 @@ export function TrimVideoPage() {
     if (!path) return;
     setStatus("analyzing");
     setError(null);
+    setRunError(null);
+    setResult(null);
     previewing.current = false;
     try {
       const info = await invoke<VideoInfo>("inspect_video", { path });
@@ -132,6 +206,17 @@ export function TrimVideoPage() {
     return () => { disposed = true; cleanup?.(); };
   }, [loadVideo]);
 
+  useEffect(() => {
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    listen<FastTrimProgress>("fast-trim-progress", (event) => {
+      if (!disposed) setProgress(event.payload);
+    }).then((unlisten) => {
+      if (disposed) unlisten(); else cleanup = unlisten;
+    });
+    return () => { disposed = true; cleanup?.(); };
+  }, []);
+
   const selectionError = useMemo<TranslationKey | null>(() => {
     if (!video || inputError) return inputError;
     if (start < 0) return "trimStartNegative";
@@ -143,7 +228,12 @@ export function TrimVideoPage() {
   const selectionValid = !!video && !selectionError;
   const selectedDuration = Math.max(0, end - start);
   const finalFormat = preserveFormat ? video?.format ?? "—" : outputFormat === "webm" ? "WebM" : outputFormat.toUpperCase();
-  const noReencoding = !!video && mode === "fast" && (preserveFormat || copyCompatible(outputFormat, video.videoCodec));
+  const targetContainer = preserveFormat ? video?.format.toLowerCase() ?? "" : outputFormat;
+  const videoCompatible = !!video && (preserveFormat || copyCompatible(outputFormat, video.videoCodec));
+  const audioCompatible = !!video && (removeAudio || audioCopyCompatible(targetContainer, video.audioCodec));
+  const fastCompatible = videoCompatible && audioCompatible;
+  const noReencoding = !!video && mode === "fast" && fastCompatible;
+  const canFastCut = selectionValid && mode === "fast" && fastCompatible && outputName.trim().length > 0 && !isProcessing;
   const startPercent = video?.durationSeconds ? Math.max(0, Math.min(100, start / video.durationSeconds * 100)) : 0;
   const endPercent = video?.durationSeconds ? Math.max(0, Math.min(100, end / video.durationSeconds * 100)) : 100;
 
@@ -194,6 +284,51 @@ export function TrimVideoPage() {
     if (player.current) player.current.currentTime = 0;
   }
 
+  async function runFastCut() {
+    if (!video || !canFastCut) return;
+    setIsProcessing(true);
+    setRunError(null);
+    setResult(null);
+    setProgress({
+      path: video.path,
+      name: video.name,
+      processedSeconds: 0,
+      durationSeconds: selectedDuration,
+      percent: 0,
+    });
+    try {
+      const value = await invoke<FastTrimResult>("fast_trim_video", {
+        request: {
+          path: video.path,
+          destinationDir: destination,
+          preserveOriginalFormat: preserveFormat,
+          outputFormat,
+          preserveMetadata,
+          removeAudio,
+          outputName,
+          startSeconds: start,
+          endSeconds: end,
+        },
+      });
+      setResult(value);
+    } catch (reason) {
+      const code = errorCode(reason);
+      setRunError(fastTrimErrors[code] ?? "trimFailed");
+    } finally {
+      setProgress(null);
+      setIsProcessing(false);
+    }
+  }
+
+  async function cancelFastCut() {
+    try {
+      await invoke("cancel_fast_trim");
+    } catch (reason) {
+      const code = errorCode(reason);
+      setRunError(fastTrimErrors[code] ?? "trimCancelFailed");
+    }
+  }
+
   return <div className="page trim-video-page">
     <header className="page-header compression-header video-header">
       <div><span className="eyebrow">{t("trimVideoModuleLabel")}</span><h1>{t("trimVideoTitle")}</h1><p>{t("trimVideoSubtitle")}</p></div>
@@ -219,10 +354,14 @@ export function TrimVideoPage() {
       <div className="convert-video-settings-grid trim-settings-grid"><section className="compress-panel trim-mode-panel"><div className="video-section-title"><Scissors size={18} /><div><h2>{t("trimPrecision")}</h2><p>{t("trimPrecisionHint")}</p></div></div><div className="trim-mode-options">{(["fast", "precise"] as CutMode[]).map((value) => <button type="button" className={mode === value ? "active" : ""} key={value} onClick={() => setMode(value)}><strong>{t(value === "fast" ? "trimFastCut" : "trimPreciseCut")}</strong><small>{t(value === "fast" ? "trimFastCutDescription" : "trimPreciseCutDescription")}</small></button>)}</div></section>
         <section className="compress-panel convert-video-options-panel"><div className="video-section-title"><Settings2 size={18} /><div><h2>{t("videoOptions")}</h2><p>{t("trimOptionsHint")}</p></div></div><div className="convert-checks"><label><input type="checkbox" checked={preserveFormat} onChange={(event) => setPreserveFormat(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><strong>{t("trimPreserveFormat")}</strong></label><label><input type="checkbox" checked={preserveMetadata} onChange={(event) => setPreserveMetadata(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><strong>{t("preserveMetadata")}</strong></label><label><input type="checkbox" checked={removeAudio} onChange={(event) => setRemoveAudio(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><strong>{t("removeAudio")}</strong></label></div><label className="convert-select"><span>{t("convertOutputFormat")}</span><select value={outputFormat} disabled={preserveFormat} onChange={(event) => setOutputFormat(event.target.value as OutputFormat)}><option value="mp4">MP4</option><option value="mov">MOV</option><option value="mkv">MKV</option><option value="webm">WebM</option></select></label></section></div>
 
-      <section className="compress-panel trim-plan-panel"><div className="video-section-title"><Clapperboard size={18} /><div><h2>{t("trimPlanTitle")}</h2><p>{t("trimPlanHint")}</p></div></div><div className="convert-plan valid"><div><span><small>{t("trimStartTime")}</small><strong>{formatTrimTime(start)}</strong></span><span><small>{t("trimEndTime")}</small><strong>{formatTrimTime(end)}</strong></span><span><small>{t("trimSelectedDuration")}</small><strong>{formatTrimTime(selectedDuration)}</strong></span><span><small>{t("convertOriginalFormat")}</small><strong>{video.format}</strong></span><span><small>{t("convertFinalFormat")}</small><strong>{finalFormat}</strong></span><span><small>{t("trimMethod")}</small><strong>{t(mode === "fast" ? "trimFastCut" : "trimPreciseCut")}</strong></span></div><p className={noReencoding ? "trim-plan-copy" : "trim-plan-encode"}>{t(noReencoding ? "trimNoReencodingPlanned" : "trimReencodingRequired")}</p></div></section>
+      <section className="compress-panel trim-plan-panel"><div className="video-section-title"><Clapperboard size={18} /><div><h2>{t("trimPlanTitle")}</h2><p>{t("trimPlanHint")}</p></div></div><div className={`convert-plan ${mode === "fast" && !fastCompatible ? "invalid" : "valid"}`}><div><span><small>{t("trimStartTime")}</small><strong>{formatTrimTime(start)}</strong></span><span><small>{t("trimEndTime")}</small><strong>{formatTrimTime(end)}</strong></span><span><small>{t("trimSelectedDuration")}</small><strong>{formatTrimTime(selectedDuration)}</strong></span><span><small>{t("convertOriginalFormat")}</small><strong>{video.format}</strong></span><span><small>{t("convertFinalFormat")}</small><strong>{finalFormat}</strong></span><span><small>{t("trimMethod")}</small><strong>{t(mode === "fast" ? "trimFastCut" : "trimPreciseCut")}</strong></span></div><p className={noReencoding ? "trim-plan-copy" : "trim-plan-encode"}>{t(noReencoding ? "trimNoReencodingPlanned" : "trimReencodingRequired")}</p>{mode === "fast" && <p className="trim-keyframe-warning"><AlertCircle size={13} />{t("trimKeyframeWarning")}</p>}{mode === "fast" && !videoCompatible && <p className="convert-validation"><AlertCircle size={13} />{t("trimFastVideoIncompatible")}</p>}{mode === "fast" && videoCompatible && !audioCompatible && <p className="convert-validation"><AlertCircle size={13} />{t("trimFastAudioIncompatible")}</p>}{mode === "precise" && <p className="convert-validation"><AlertCircle size={13} />{t("trimPreciseNotAvailable")}</p>}</div></section>
 
       <section className="compress-panel video-destination-panel"><div><FolderOpen size={19} /><span><strong>{t("destinationFolder")}</strong><small title={destination ?? ""}>{destination ?? t("videoAutomaticDestination")}</small></span></div><button className="secondary-button" type="button" onClick={async () => { const selected = await open({ directory: true, multiple: false }); if (typeof selected === "string") setDestination(selected); }}>{t("chooseFolder")}</button></section><label className="compress-panel trim-output-name"><span>{t("trimOutputName")}</span><input value={outputName} onChange={(event) => setOutputName(event.target.value)} /></label>
-      <button className="run-button trim-video-button" type="button" disabled title={selectionValid ? t("trimNotImplemented") : selectionError ? t(selectionError) : undefined}><Scissors size={19} />{t("trimVideoAction")}</button>
+      {runError && <p className="video-row-error trim-run-error"><AlertCircle size={14} />{t(runError)}</p>}
+      {progress && <section className="video-progress-panel trim-progress"><div><span>{t("trimFastCutProcessing")}</span><strong>{progress.name}</strong><b>{progress.percent.toFixed(1)}%</b></div><progress max="100" value={progress.percent} /><small>{formatTrimTime(progress.processedSeconds)} / {formatTrimTime(progress.durationSeconds)}</small></section>}
+      {result && <section className="compress-panel trim-result"><div className="convert-result-mode"><CheckCircle2 size={14} />{t("trimFastCutCompleted")}</div><div className="convert-result-grid"><span><small>{t("trimRequestedStart")}</small><strong>{formatTrimTime(result.requestedStartSeconds)}</strong></span><span><small>{t("trimRequestedEnd")}</small><strong>{formatTrimTime(result.requestedEndSeconds)}</strong></span><span><small>{t("trimRequestedDuration")}</small><strong>{formatTrimTime(result.requestedDurationSeconds)}</strong></span><span><small>{t("trimDetectedStart")}</small><strong>{formatTrimTime(result.detectedActualStartSeconds)}</strong></span><span><small>{t("trimActualDuration")}</small><strong>{formatTrimTime(result.finalDurationSeconds)}</strong></span><span><small>{t("trimKeyframeOffset")}</small><strong>{result.keyframeOffsetSeconds >= 0 ? "+" : ""}{result.keyframeOffsetSeconds.toFixed(3)} s</strong></span><span><small>{t("convertFinalFormat")}</small><strong>{result.finalFormat}</strong></span><span><small>{t("finalCodec")}</small><strong>{result.finalVideoCodec}</strong></span><span><small>{t("audioCodec")}</small><strong>{result.finalAudioCodec ?? t("noAudio")}</strong></span><span><small>{t("originalSize")}</small><strong>{formatBytes(result.originalSize)}</strong></span><span><small>{t("convertFinalSize")}</small><strong>{formatBytes(result.finalSize)}</strong></span><span><small>{t("processingDuration")}</small><strong>{formatTrimTime(result.processingDurationSeconds)}</strong></span></div><div className="video-result-location"><FolderOpen size={13} /><span title={result.outputPath}>{result.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => setPreviewResult(true)}><Play size={13} />{t("previewVideo")}</button><button className="text-button" type="button" onClick={() => void openPath(result.outputPath)}><Video size={13} />{t("openVideo")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(result.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></section>}
+      {isProcessing ? <button className="run-button video-cancel-button trim-video-button" type="button" onClick={() => void cancelFastCut()}><Ban size={19} />{t("trimCancel")}</button> : <button className="run-button trim-video-button" type="button" disabled={!canFastCut} title={mode === "precise" ? t("trimPreciseNotAvailable") : !selectionValid && selectionError ? t(selectionError) : !fastCompatible ? t("trimFastIncompatible") : undefined} onClick={() => void runFastCut()}><Scissors size={19} />{t("trimVideoAction")}</button>}
+      {previewResult && result && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(false); }}><section className="video-preview-modal" role="dialog" aria-modal="true" aria-label={t("previewVideo")}><header><div><strong>{result.outputName}</strong><small>{result.finalVideoCodec} · {formatTrimTime(result.finalDurationSeconds)}</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(false)}><X size={17} /></button></header><video src={convertFileSrc(result.outputPath)} controls autoPlay /></section></div>}
     </>}
   </div>;
 }

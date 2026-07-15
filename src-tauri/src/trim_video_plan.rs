@@ -180,20 +180,12 @@ mod tests {
         let long = temp.path().join("long.mp4");
         create_video(&short, 1);
         create_video(&long, 12);
-        let short_info = inspect_video_with_tools(
-            &short,
-            &tool("ffprobe"),
-            &tool("ffmpeg"),
-            &libraries(),
-        )
-        .unwrap();
-        let long_info = inspect_video_with_tools(
-            &long,
-            &tool("ffprobe"),
-            &tool("ffmpeg"),
-            &libraries(),
-        )
-        .unwrap();
+        let short_info =
+            inspect_video_with_tools(&short, &tool("ffprobe"), &tool("ffmpeg"), &libraries())
+                .unwrap();
+        let long_info =
+            inspect_video_with_tools(&long, &tool("ffprobe"), &tool("ffmpeg"), &libraries())
+                .unwrap();
         assert!((short_info.duration_seconds - 1.0).abs() < 0.1);
         assert!((long_info.duration_seconds - 12.0).abs() < 0.1);
         assert!(validate_trim_selection(0.0, 0.5, short_info.duration_seconds).is_ok());
