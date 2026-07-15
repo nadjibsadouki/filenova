@@ -9,6 +9,7 @@ import { PdfToolsPage } from "./pages/PdfToolsPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { CompressVideoPage } from "./pages/CompressVideoPage";
 import { ConvertVideoPage } from "./pages/ConvertVideoPage";
+import { ExtractAudioPage } from "./pages/ExtractAudioPage";
 
 function App() {
   const [activePage, setActivePage] = useState<PageId>("home");
@@ -32,6 +33,8 @@ function App() {
           <CompressVideoPage />
         ) : activePage === "convert-video" ? (
           <ConvertVideoPage />
+        ) : activePage === "extract-audio" ? (
+          <ExtractAudioPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}

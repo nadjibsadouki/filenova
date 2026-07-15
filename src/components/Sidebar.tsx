@@ -15,7 +15,11 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
   const renderItem = (item: (typeof navigationItems)[number]) => {
     const Icon = item.icon;
-    const label = item.id === "convert-video" ? t("convertVideoNav") : item.label;
+    const label = item.id === "convert-video"
+      ? t("convertVideoNav")
+      : item.id === "extract-audio"
+        ? t("extractAudioNav")
+        : item.label;
     return (
       <button
         className={`nav-item${activePage === item.id ? " active" : ""}`}

@@ -1,3 +1,4 @@
+mod audio_extraction_plan;
 mod compression;
 mod conversion;
 mod images_pdf;
@@ -13,6 +14,9 @@ mod video_conversion_plan;
 mod video_target_size;
 mod video_tools;
 
+use audio_extraction_plan::{
+    get_audio_extraction_capabilities, inspect_audio_source, plan_audio_extraction,
+};
 use compression::{compress_image, inspect_image};
 use conversion::{convert_image, inspect_convertible_image};
 use images_pdf::images_to_pdf;
@@ -62,7 +66,10 @@ pub fn run() {
             plan_video_conversion,
             get_video_conversion_capabilities,
             convert_video,
-            cancel_video_conversion
+            cancel_video_conversion,
+            get_audio_extraction_capabilities,
+            inspect_audio_source,
+            plan_audio_extraction
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");
