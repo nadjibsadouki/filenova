@@ -10,6 +10,7 @@ import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { CompressVideoPage } from "./pages/CompressVideoPage";
 import { ConvertVideoPage } from "./pages/ConvertVideoPage";
 import { ExtractAudioPage } from "./pages/ExtractAudioPage";
+import { TrimVideoPage } from "./pages/TrimVideoPage";
 
 function App() {
   const [activePage, setActivePage] = useState<PageId>("home");
@@ -35,6 +36,8 @@ function App() {
           <ConvertVideoPage />
         ) : activePage === "extract-audio" ? (
           <ExtractAudioPage />
+        ) : activePage === "trim-video" ? (
+          <TrimVideoPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}

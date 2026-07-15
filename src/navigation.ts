@@ -20,6 +20,7 @@ export type PageId =
   | "video-tools"
   | "convert-video"
   | "extract-audio"
+  | "trim-video"
   | "history"
   | "settings";
 
@@ -39,6 +40,7 @@ export const navigationItems: NavigationItem[] = [
   { id: "video-tools", label: "Video Tools", icon: Clapperboard, group: "workspace" },
   { id: "convert-video", label: "Convert Video", icon: RefreshCw, group: "workspace" },
   { id: "extract-audio", label: "Extract Audio", icon: FileAudio2, group: "workspace" },
+  { id: "trim-video", label: "Trim Video", icon: Clapperboard, group: "workspace" },
   { id: "history", label: "Processing History", icon: Clock3, group: "account" },
   { id: "settings", label: "Settings", icon: Settings2, group: "account" },
 ];

@@ -8,6 +8,8 @@ mod pdf_organize;
 mod pdf_split;
 mod pdf_to_images;
 mod resizing;
+#[allow(dead_code)]
+mod trim_video_plan;
 mod video_compression;
 mod video_conversion;
 mod video_conversion_plan;
@@ -27,6 +29,7 @@ use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
 use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_output};
 use resizing::resize_image;
+use trim_video_plan::allow_trim_video_preview;
 use video_compression::{
     cancel_video_compression, compress_recommended_video, delete_video_result,
     keep_video_target_result, VideoCompressionState,
@@ -74,7 +77,8 @@ pub fn run() {
             inspect_audio_source,
             plan_audio_extraction,
             extract_audio,
-            cancel_audio_extraction
+            cancel_audio_extraction,
+            allow_trim_video_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

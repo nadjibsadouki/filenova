@@ -19,6 +19,8 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
       ? t("convertVideoNav")
       : item.id === "extract-audio"
         ? t("extractAudioNav")
+        : item.id === "trim-video"
+          ? t("trimVideoNav")
         : item.label;
     return (
       <button
