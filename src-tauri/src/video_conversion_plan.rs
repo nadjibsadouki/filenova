@@ -1,4 +1,73 @@
+use std::{path::Path, process::Command, sync::OnceLock};
+
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+
+use crate::video_tools::{find_sidecar, path_with_runtime_libraries, runtime_library_dir};
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoConversionCapabilities {
+    pub(crate) openh264: bool,
+    pub(crate) svt_av1: bool,
+    pub(crate) aac: bool,
+    pub(crate) opus: bool,
+    pub(crate) vp9: bool,
+    pub(crate) vorbis: bool,
+    pub(crate) webm_muxer: bool,
+    pub(crate) matroska_muxer: bool,
+    pub(crate) av1_decoder: bool,
+    pub(crate) vp9_decoder: bool,
+    pub(crate) vp8_decoder: bool,
+}
+
+pub(crate) fn detect_video_conversion_capabilities(
+    ffmpeg: &Path,
+    library_dir: &Path,
+) -> Result<VideoConversionCapabilities, String> {
+    static CAPABILITIES: OnceLock<Result<VideoConversionCapabilities, String>> = OnceLock::new();
+    CAPABILITIES
+        .get_or_init(|| query_video_conversion_capabilities(ffmpeg, library_dir))
+        .clone()
+}
+
+fn query_video_conversion_capabilities(
+    ffmpeg: &Path,
+    library_dir: &Path,
+) -> Result<VideoConversionCapabilities, String> {
+    let run = |argument: &str| {
+        Command::new(ffmpeg)
+            .args(["-hide_banner", argument])
+            .env("PATH", path_with_runtime_libraries(library_dir))
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .map_err(|error| error.to_string())
+    };
+    let encoders = run("-encoders")?;
+    let decoders = run("-decoders")?;
+    let muxers = run("-muxers")?;
+    Ok(VideoConversionCapabilities {
+        openh264: encoders.contains("libopenh264"),
+        svt_av1: encoders.contains("libsvtav1"),
+        aac: encoders.lines().any(|line| line.contains(" aac ")),
+        opus: encoders.contains("libopus"),
+        vp9: encoders.contains("libvpx-vp9"),
+        vorbis: encoders.contains("libvorbis"),
+        webm_muxer: muxers.lines().any(|line| line.contains(" webm ")),
+        matroska_muxer: muxers.lines().any(|line| line.contains(" matroska ")),
+        av1_decoder: decoders.lines().any(|line| line.contains(" av1 ")),
+        vp9_decoder: decoders.lines().any(|line| line.contains(" vp9 ")),
+        vp8_decoder: decoders.lines().any(|line| line.contains(" vp8 ")),
+    })
+}
+
+#[tauri::command]
+pub fn get_video_conversion_capabilities(
+    app: AppHandle,
+) -> Result<VideoConversionCapabilities, String> {
+    let ffmpeg = find_sidecar(&app, "ffmpeg")?;
+    detect_video_conversion_capabilities(&ffmpeg, &runtime_library_dir(&app))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,7 +125,11 @@ pub fn build_video_conversion_plan(request: &VideoConversionPlanRequest) -> Vide
         && request.preserve_resolution
         && request.preserve_frame_rate;
     let planned_video = match requested_video.as_str() {
-        "AUTO" if matches!(container.as_str(), "MP4" | "MOV") && can_copy_video => "Copy",
+        "AUTO"
+            if matches!(container.as_str(), "MP4" | "MOV" | "WEBM" | "MKV") && can_copy_video =>
+        {
+            "Copy"
+        }
         "AUTO" if container == "WEBM" => "SVT-AV1",
         "AUTO" => "OpenH264",
         "OPENH264" => "OpenH264",
@@ -72,7 +145,11 @@ pub fn build_video_conversion_plan(request: &VideoConversionPlanRequest) -> Vide
     let planned_audio = match requested_audio.as_str() {
         "NOAUDIO" => None,
         "AUTO" if input_audio.is_none() => None,
-        "AUTO" if matches!(container.as_str(), "MP4" | "MOV") && can_copy_audio => Some("Copy"),
+        "AUTO"
+            if matches!(container.as_str(), "MP4" | "MOV" | "WEBM" | "MKV") && can_copy_audio =>
+        {
+            Some("Copy")
+        }
         "AUTO" if container == "WEBM" => Some("Opus"),
         "AUTO" => Some("AAC"),
         "AAC" => Some("AAC"),

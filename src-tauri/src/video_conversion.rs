@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use crate::{
-    video_conversion_plan::{build_video_conversion_plan, VideoConversionPlanRequest},
+    video_conversion_plan::{
+        build_video_conversion_plan, detect_video_conversion_capabilities,
+        VideoConversionPlanRequest,
+    },
     video_tools::{
         find_sidecar, inspect_video_with_tools, path_with_runtime_libraries, runtime_library_dir,
     },
@@ -71,6 +74,7 @@ pub struct ConvertVideoResult {
     original_audio_codec: Option<String>,
     final_audio_codec: Option<String>,
     remux_without_reencoding: bool,
+    selected_quality: Option<u8>,
     width: u64,
     height: u64,
     frames_per_second: f64,
@@ -161,10 +165,10 @@ where
 {
     let started_at = Instant::now();
     let output_format = request.output_format.to_ascii_lowercase();
-    if !matches!(output_format.as_str(), "mp4" | "mov") {
+    if !matches!(output_format.as_str(), "mp4" | "mov" | "webm" | "mkv") {
         return Err(VideoConversionError::new(
             "conversion_format_not_implemented",
-            "Real conversion currently supports MP4 and MOV only.",
+            "The selected output container is not supported.",
         ));
     }
     let input_path = PathBuf::from(&request.path);
@@ -178,6 +182,16 @@ where
     }
 
     validate_custom_options(&request)?;
+    let capabilities = detect_video_conversion_capabilities(ffmpeg, library_dir)
+        .map_err(|error| VideoConversionError::new("ffmpeg_unavailable", error))?;
+    if (output_format == "webm" && !capabilities.webm_muxer)
+        || (output_format == "mkv" && !capabilities.matroska_muxer)
+    {
+        return Err(VideoConversionError::new(
+            "conversion_codec_unavailable",
+            "The embedded FFmpeg build does not provide the selected output muxer.",
+        ));
+    }
     let plan_request = VideoConversionPlanRequest {
         input_video_codec: input.video_codec.clone(),
         input_audio_codec: input.audio_codec.clone(),
@@ -195,10 +209,30 @@ where
                 .unwrap_or_else(|| "The selected streams are incompatible.".into()),
         ));
     }
-    if plan.planned_video_codec == "SVT-AV1" {
+    if plan.planned_video_codec == "OpenH264" && !capabilities.openh264 {
         return Err(VideoConversionError::new(
-            "conversion_codec_not_implemented",
-            "MP4 and MOV conversion currently supports Copy or OpenH264 video only.",
+            "conversion_codec_unavailable",
+            "OpenH264 is not available in the embedded FFmpeg build.",
+        ));
+    }
+    if plan.planned_video_codec == "SVT-AV1"
+        && (!capabilities.svt_av1 || !matches!(output_format.as_str(), "webm" | "mkv"))
+    {
+        return Err(VideoConversionError::new(
+            "conversion_codec_unavailable",
+            "SVT-AV1 is unavailable or incompatible with the selected container.",
+        ));
+    }
+    if plan.planned_audio_codec.as_deref() == Some("AAC") && !capabilities.aac {
+        return Err(VideoConversionError::new(
+            "conversion_codec_unavailable",
+            "AAC is not available in the embedded FFmpeg build.",
+        ));
+    }
+    if plan.planned_audio_codec.as_deref() == Some("Opus") && !capabilities.opus {
+        return Err(VideoConversionError::new(
+            "conversion_codec_unavailable",
+            "Opus is not available in the embedded FFmpeg build.",
         ));
     }
 
@@ -278,12 +312,17 @@ where
     });
     Ok(ConvertVideoResult {
         original_format: input.format,
-        final_format: output_format.to_ascii_uppercase(),
+        final_format: if output_format == "webm" {
+            "WebM".into()
+        } else {
+            output_format.to_ascii_uppercase()
+        },
         original_video_codec: input.video_codec,
         final_video_codec: verified.video_codec,
         original_audio_codec: input.audio_codec,
         final_audio_codec: verified.audio_codec,
         remux_without_reencoding: plan.remux_without_reencoding,
+        selected_quality: (!plan.remux_without_reencoding).then_some(request.quality),
         width: verified.width,
         height: verified.height,
         frames_per_second: verified.frames_per_second,
@@ -376,6 +415,21 @@ fn openh264_quality_value(quality: u8) -> u8 {
     17
 }
 
+fn svt_av1_crf(quality: u8) -> u8 {
+    let points = [(1_u8, 50_u8), (50, 35), (75, 28), (100, 18)];
+    let quality = quality.clamp(1, 100);
+    for pair in points.windows(2) {
+        let (left_quality, left_value) = pair[0];
+        let (right_quality, right_value) = pair[1];
+        if quality <= right_quality {
+            let position = (quality - left_quality) as f64 / (right_quality - left_quality) as f64;
+            return (left_value as f64 + (right_value as f64 - left_value as f64) * position).round()
+                as u8;
+        }
+    }
+    18
+}
+
 fn conversion_args(
     request: &ConvertVideoRequest,
     plan: &crate::video_conversion_plan::VideoConversionPlan,
@@ -428,25 +482,45 @@ fn conversion_args(
             if let Some(fps) = frame_rate {
                 args.extend(["-r".into(), format!("{fps:.6}").into()]);
             }
-            let quality = openh264_quality_value(request.quality);
-            args.extend([
-                "-c:v".into(),
-                "libopenh264".into(),
-                "-rc_mode".into(),
-                "quality".into(),
-                "-qmin".into(),
-                quality.to_string().into(),
-                "-qmax".into(),
-                quality.to_string().into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-profile:v".into(),
-                "main".into(),
-            ]);
+            if plan.planned_video_codec == "SVT-AV1" {
+                args.extend([
+                    "-c:v".into(),
+                    "libsvtav1".into(),
+                    "-crf".into(),
+                    svt_av1_crf(request.quality).to_string().into(),
+                    "-preset".into(),
+                    "8".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]);
+            } else {
+                let quality = openh264_quality_value(request.quality);
+                args.extend([
+                    "-c:v".into(),
+                    "libopenh264".into(),
+                    "-rc_mode".into(),
+                    "quality".into(),
+                    "-qmin".into(),
+                    quality.to_string().into(),
+                    "-qmax".into(),
+                    quality.to_string().into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                    "-profile:v".into(),
+                    "main".into(),
+                ]);
+            }
         }
         if !no_audio {
             if audio_copy {
                 args.extend(["-c:a".into(), "copy".into()]);
+            } else if plan.planned_audio_codec.as_deref() == Some("Opus") {
+                args.extend([
+                    "-c:a".into(),
+                    "libopus".into(),
+                    "-b:a".into(),
+                    "128k".into(),
+                ]);
             } else {
                 args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
             }
@@ -686,6 +760,7 @@ mod tests {
     fn create_source(path: &Path, format: &str, duration: u64, size: &str) {
         let (video_codec, audio_codec) = match format {
             "avi" => ("mpeg4", "mp3"),
+            "webm" => ("libvpx-vp9", "libopus"),
             _ => ("libopenh264", "aac"),
         };
         let mut command = Command::new(bundled_tool("ffmpeg"));
@@ -709,6 +784,8 @@ mod tests {
             ])
             .args(if video_codec == "libopenh264" {
                 vec!["-rc_mode", "quality", "-qmin", "24", "-qmax", "24"]
+            } else if video_codec == "libvpx-vp9" {
+                vec!["-deadline", "realtime", "-cpu-used", "8"]
             } else {
                 Vec::new()
             })
@@ -730,6 +807,20 @@ mod tests {
         assert_eq!(openh264_quality_value(70), 23);
         assert_eq!(openh264_quality_value(85), 20);
         assert_eq!(openh264_quality_value(100), 17);
+        assert_eq!(svt_av1_crf(1), 50);
+        assert_eq!(svt_av1_crf(50), 35);
+        assert_eq!(svt_av1_crf(75), 28);
+        assert_eq!(svt_av1_crf(100), 18);
+    }
+
+    #[test]
+    fn bundled_ffmpeg_reports_required_webm_and_mkv_capabilities() {
+        let capabilities =
+            detect_video_conversion_capabilities(&bundled_tool("ffmpeg"), &library_dir()).unwrap();
+        assert!(capabilities.svt_av1 && capabilities.opus);
+        assert!(capabilities.webm_muxer && capabilities.matroska_muxer);
+        assert!(capabilities.av1_decoder);
+        assert!(capabilities.vp8_decoder && capabilities.vp9_decoder);
     }
 
     #[test]
@@ -804,6 +895,34 @@ mod tests {
         assert!(encode.contains("-vf scale=160:90 -r 15.000000"));
         for forbidden in ["libx264", "-crf", "preset", "-pass", "passlog"] {
             assert!(!encode.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn webm_args_use_only_confirmed_svt_av1_and_opus_options() {
+        let path = Path::new("C:\\input.mp4");
+        let output = Path::new("C:\\output.webm");
+        let mut req = request(path, Path::new("C:\\"), "webm");
+        req.video_codec = "svtAv1".into();
+        req.audio_codec = "opus".into();
+        let plan = build_video_conversion_plan(&VideoConversionPlanRequest {
+            input_video_codec: "H264".into(),
+            input_audio_codec: Some("AAC".into()),
+            output_format: "webm".into(),
+            video_codec: "svtAv1".into(),
+            audio_codec: "opus".into(),
+            preserve_resolution: true,
+            preserve_frame_rate: true,
+        });
+        let args = conversion_args(&req, &plan, path, output, None, None)
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(args.contains("-c:v libsvtav1 -crf 28 -preset 8 -pix_fmt yuv420p"));
+        assert!(args.contains("-c:a libopus -b:a 128k"));
+        for forbidden in ["libopenh264", "libx264", " aac ", "-pass", "passlog"] {
+            assert!(!args.contains(forbidden));
         }
     }
 
@@ -928,6 +1047,138 @@ mod tests {
     }
 
     #[test]
+    fn really_remuxes_webm_to_webm_and_mkv_and_mp4_to_mkv() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let webm = temp.path().join("source.webm");
+        let mp4 = temp.path().join("source.mp4");
+        create_source(&webm, "webm", 1, "320x180");
+        create_source(&mp4, "mp4", 1, "320x180");
+        let webm_original = fs::read(&webm).unwrap();
+        let mp4_original = fs::read(&mp4).unwrap();
+        let state = VideoConversionState::default();
+
+        let webm_result = convert_video_with_tools(
+            request(&webm, &output_dir, "webm"),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        let duplicate = convert_video_with_tools(
+            request(&webm, &output_dir, "webm"),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        let webm_mkv = convert_video_with_tools(
+            request(&webm, &output_dir, "mkv"),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        let mp4_mkv = convert_video_with_tools(
+            request(&mp4, &output_dir, "mkv"),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(webm_result.remux_without_reencoding);
+        assert!(webm_mkv.remux_without_reencoding);
+        assert!(mp4_mkv.remux_without_reencoding);
+        assert_eq!(webm_result.output_name, "source-converted.webm");
+        assert_eq!(duplicate.output_name, "source-converted-2.webm");
+        assert_eq!(webm_mkv.output_name, "source-converted.mkv");
+        assert_eq!(mp4_mkv.final_video_codec, "H264");
+        assert_eq!(fs::read(&webm).unwrap(), webm_original);
+        assert_eq!(fs::read(&mp4).unwrap(), mp4_original);
+    }
+
+    #[test]
+    fn really_encodes_webm_and_mkv_with_svt_av1_opus_and_openh264_aac() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let mp4 = temp.path().join("camera.mp4");
+        let avi = temp.path().join("legacy.avi");
+        create_source(&mp4, "mp4", 1, "320x180");
+        create_source(&avi, "avi", 1, "320x180");
+        let mp4_original = fs::read(&mp4).unwrap();
+        let avi_original = fs::read(&avi).unwrap();
+        let state = VideoConversionState::default();
+
+        let webm = convert_video_with_tools(
+            request(&mp4, &output_dir, "webm"),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        assert!(!webm.remux_without_reencoding);
+        assert_eq!(webm.final_video_codec, "AV1");
+        assert_eq!(webm.final_audio_codec.as_deref(), Some("OPUS"));
+        assert_eq!(webm.selected_quality, Some(75));
+
+        let mut mkv_request = request(&avi, &output_dir, "mkv");
+        mkv_request.video_codec = "openh264".into();
+        mkv_request.audio_codec = "aac".into();
+        mkv_request.preserve_resolution = false;
+        mkv_request.custom_width = Some(160);
+        mkv_request.preserve_frame_rate = false;
+        mkv_request.custom_frame_rate = Some(15.0);
+        let mkv = convert_video_with_tools(
+            mkv_request,
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(mkv.final_video_codec, "H264");
+        assert_eq!(mkv.final_audio_codec.as_deref(), Some("AAC"));
+        assert_eq!((mkv.width, mkv.height), (160, 90));
+        assert!((mkv.frames_per_second - 15.0).abs() < 0.05);
+
+        let mut silent = request(&mp4, &output_dir, "mkv");
+        silent.video_codec = "svtAv1".into();
+        silent.audio_codec = "noAudio".into();
+        let silent = convert_video_with_tools(
+            silent,
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(silent.final_video_codec, "AV1");
+        assert_eq!(silent.final_audio_codec, None);
+        assert_eq!(fs::read(&mp4).unwrap(), mp4_original);
+        assert_eq!(fs::read(&avi).unwrap(), avi_original);
+        assert!(fs::read_dir(&output_dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp.")));
+    }
+
+    #[test]
     fn cancellation_stops_only_conversion_ffmpeg_and_cleans_temporary_file() {
         let temp = tempfile::tempdir().unwrap();
         let output_dir = temp.path().join("outputs");
@@ -935,14 +1186,15 @@ mod tests {
         let source = temp.path().join("long.avi");
         create_source(&source, "avi", 8, "1280x720");
         let original = fs::read(&source).unwrap();
+        detect_video_conversion_capabilities(&bundled_tool("ffmpeg"), &library_dir()).unwrap();
         let state = VideoConversionState::default();
         let worker_state = state.clone();
         let worker_source = source.clone();
         let worker_output = output_dir.clone();
         let worker = thread::spawn(move || {
-            let mut conversion = request(&worker_source, &worker_output, "mp4");
-            conversion.video_codec = "openh264".into();
-            conversion.audio_codec = "aac".into();
+            let mut conversion = request(&worker_source, &worker_output, "webm");
+            conversion.video_codec = "svtAv1".into();
+            conversion.audio_codec = "opus".into();
             convert_video_with_tools(
                 conversion,
                 &bundled_tool("ffmpeg"),

@@ -26,7 +26,7 @@ use video_compression::{
     keep_video_target_result, VideoCompressionState,
 };
 use video_conversion::{cancel_video_conversion, convert_video, VideoConversionState};
-use video_conversion_plan::plan_video_conversion;
+use video_conversion_plan::{get_video_conversion_capabilities, plan_video_conversion};
 use video_tools::inspect_video;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -60,6 +60,7 @@ pub fn run() {
             delete_video_result,
             keep_video_target_result,
             plan_video_conversion,
+            get_video_conversion_capabilities,
             convert_video,
             cancel_video_conversion
         ])

@@ -51,6 +51,20 @@ interface ConversionPlan {
   remuxWithoutReencoding: boolean;
 }
 
+interface ConversionCapabilities {
+  openh264: boolean;
+  svtAv1: boolean;
+  aac: boolean;
+  opus: boolean;
+  vp9: boolean;
+  vorbis: boolean;
+  webmMuxer: boolean;
+  matroskaMuxer: boolean;
+  av1Decoder: boolean;
+  vp9Decoder: boolean;
+  vp8Decoder: boolean;
+}
+
 interface VideoItem extends Partial<VideoInfo> {
   path: string;
   name: string;
@@ -70,6 +84,7 @@ interface ConversionResult {
   originalAudioCodec: string | null;
   finalAudioCodec: string | null;
   remuxWithoutReencoding: boolean;
+  selectedQuality: number | null;
   width: number;
   height: number;
   framesPerSecond: number;
@@ -113,6 +128,7 @@ const inspectErrorKeys: Record<string, TranslationKey> = {
   inspection_failed: "videoInspectionFailed",
   conversion_format_not_implemented: "convertFormatNotImplemented",
   conversion_codec_not_implemented: "convertCodecNotImplemented",
+  conversion_codec_unavailable: "convertCodecNotImplemented",
   incompatible_conversion_plan: "convertPlanUnavailable",
   invalid_custom_resolution: "convertResolutionInvalid",
   invalid_custom_frame_rate: "convertFrameRateInvalid",
@@ -199,6 +215,7 @@ export function ConvertVideoPage() {
   const [activeProgress, setActiveProgress] = useState<ConversionProgress | null>(null);
   const [batchPosition, setBatchPosition] = useState({ current: 0, total: 0 });
   const [previewResult, setPreviewResult] = useState<ConversionResult | null>(null);
+  const [capabilities, setCapabilities] = useState<ConversionCapabilities | null>(null);
   const urls = useRef(new Set<string>());
   const cancellationRequested = useRef(false);
 
@@ -210,19 +227,36 @@ export function ConvertVideoPage() {
     && readyItems.every((item) => item.audioCodec && audioCopySupported(outputFormat, item.audioCodec));
   const videoChoices = useMemo<VideoCodec[]>(() => {
     const choices: VideoCodec[] = ["auto"];
-    if (outputFormat !== "webm") choices.push("openh264");
-    if (outputFormat === "webm" || outputFormat === "mkv") choices.push("svtAv1");
+    if (capabilities?.openh264 && outputFormat !== "webm") choices.push("openh264");
+    if (capabilities?.svtAv1 && (outputFormat === "webm" || outputFormat === "mkv")) choices.push("svtAv1");
     if (copyVideoAvailable) choices.push("copy");
     return choices;
-  }, [copyVideoAvailable, outputFormat]);
+  }, [capabilities, copyVideoAvailable, outputFormat]);
   const audioChoices = useMemo<AudioCodec[]>(() => {
     const choices: AudioCodec[] = ["auto"];
-    if (outputFormat === "mp4" || outputFormat === "mov" || outputFormat === "mkv") choices.push("aac");
-    if (outputFormat === "webm" || outputFormat === "mkv") choices.push("opus");
+    if (capabilities?.aac && (outputFormat === "mp4" || outputFormat === "mov" || outputFormat === "mkv")) choices.push("aac");
+    if (capabilities?.opus && (outputFormat === "webm" || outputFormat === "mkv")) choices.push("opus");
     if (copyAudioAvailable) choices.push("copy");
     choices.push("noAudio");
     return choices;
-  }, [copyAudioAvailable, outputFormat]);
+  }, [capabilities, copyAudioAvailable, outputFormat]);
+
+  const outputFormats = useMemo<OutputFormat[]>(() => {
+    const formats: OutputFormat[] = ["mp4", "mov"];
+    if (capabilities?.webmMuxer && capabilities.svtAv1 && capabilities.opus) formats.splice(1, 0, "webm");
+    if (capabilities?.matroskaMuxer) formats.push("mkv");
+    return formats;
+  }, [capabilities]);
+
+  useEffect(() => {
+    invoke<ConversionCapabilities>("get_video_conversion_capabilities")
+      .then(setCapabilities)
+      .catch((error) => setNotice(parseError(error).message || t("ffmpegUnavailable")));
+  }, [t]);
+
+  useEffect(() => {
+    if (!outputFormats.includes(outputFormat)) setOutputFormat(outputFormats[0]);
+  }, [outputFormat, outputFormats]);
 
   useEffect(() => {
     if (!videoChoices.includes(videoCodec)) setVideoCodec("auto");
@@ -334,8 +368,7 @@ export function ConvertVideoPage() {
   const resolutionValid = preserveResolution || ((width !== null || height !== null) && validDimension(width) && validDimension(height));
   const frameRateValid = preserveFrameRate || (Number.isFinite(fps) && fps > 0 && fps <= 240);
   const plansReady = readyItems.length > 0 && readyItems.every((item) => item.plan?.valid);
-  const outputImplemented = outputFormat === "mp4" || outputFormat === "mov";
-  const canConvert = outputImplemented && plansReady && resolutionValid && frameRateValid && !isProcessing;
+  const canConvert = capabilities !== null && plansReady && resolutionValid && frameRateValid && !isProcessing;
   const codecLabel = (codec: VideoCodec | AudioCodec, kind: "video" | "audio") => t(({
     auto: "convertVideoCodecAuto",
     openh264: "convertVideoCodecOpenH264",
@@ -432,13 +465,13 @@ export function ConvertVideoPage() {
         <div className="video-thumbnail">{item.thumbnailUrl ? <img src={item.thumbnailUrl} alt="" /> : item.status === "analyzing" ? <LoaderCircle className="spin" size={22} /> : <ImageOff size={21} />}</div>
         <div className="convert-video-file"><div className="video-file-title"><div><strong>{item.name}</strong><small title={item.path}>{item.path}</small></div><div className={`video-status ${item.status}`}>{item.status === "analyzing" || item.status === "converting" || item.status === "remuxing" ? <LoaderCircle className="spin" size={13} /> : item.status === "ready" || item.status === "completed" ? <CheckCircle2 size={13} /> : item.status === "cancelled" ? <Ban size={13} /> : item.status === "waiting" ? <RefreshCw size={13} /> : <AlertCircle size={13} />}<span>{t(item.status === "analyzing" ? "analyzingVideo" : item.status === "ready" ? "videoReady" : item.status === "waiting" ? "convertWaiting" : item.status === "converting" ? "convertConverting" : item.status === "remuxing" ? "convertRemuxing" : item.status === "completed" ? "videoCompleted" : item.status === "cancelled" ? "videoCancelled" : "videoFailed")}</span></div></div>
           {item.status === "failed" || item.status === "cancelled" ? <p className="video-row-error"><AlertCircle size={14} />{t(inspectErrorKeys[item.errorCode ?? ""] ?? "videoInspectionFailed")}</p> : <div className="convert-video-metadata"><span><small>{t("format")}</small><strong>{item.format ?? "—"}</strong></span><span><small>{t("videoDuration")}</small><strong>{formatDuration(item.durationSeconds)}</strong></span><span><small>{t("resolution")}</small><strong>{item.width} × {item.height}</strong></span><span><small>{t("fileSize")}</small><strong>{formatBytes(item.size)}</strong></span><span><small>{t("videoCodec")}</small><strong>{item.videoCodec}</strong></span><span><small>{t("audioCodec")}</small><strong>{item.audioCodec ?? t("noAudio")}</strong></span><span><small>{t("convertVideoFrameRate")}</small><strong>{item.framesPerSecond?.toFixed(3)} fps</strong></span></div>}
-          {item.result && <div className="convert-result"><div className="convert-result-mode"><CheckCircle2 size={14} />{t(item.result.remuxWithoutReencoding ? "convertRemux" : "convertReencode")}</div><div className="convert-result-grid"><span><small>{t("convertOriginalFormat")}</small><strong>{item.result.originalFormat}</strong></span><span><small>{t("convertFinalFormat")}</small><strong>{item.result.finalFormat}</strong></span><span><small>{t("convertOriginalVideoCodec")}</small><strong>{item.result.originalVideoCodec}</strong></span><span><small>{t("finalCodec")}</small><strong>{item.result.finalVideoCodec}</strong></span><span><small>{t("convertOriginalAudioCodec")}</small><strong>{item.result.originalAudioCodec ?? t("noAudio")}</strong></span><span><small>{t("convertPlannedAudioCodec")}</small><strong>{item.result.finalAudioCodec ?? t("noAudio")}</strong></span><span><small>{t("finalResolution")}</small><strong>{item.result.width} × {item.result.height}</strong></span><span><small>{t("convertVideoFrameRate")}</small><strong>{item.result.framesPerSecond.toFixed(3)} fps</strong></span><span><small>{t("originalSize")}</small><strong>{formatBytes(item.result.originalSize)}</strong></span><span><small>{t("convertFinalSize")}</small><strong>{formatBytes(item.result.finalSize)}</strong></span><span><small>{t("processingDuration")}</small><strong>{formatDuration(item.result.processingDurationSeconds)}</strong></span></div><div className="video-result-location"><FolderOpen size={13} /><span title={item.result.outputPath}>{item.result.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => setPreviewResult(item.result!)}><Play size={13} />{t("previewVideo")}</button><button className="text-button" type="button" onClick={() => void openPath(item.result!.outputPath)}><Video size={13} />{t("openVideo")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(item.result!.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></div>}
+          {item.result && <div className="convert-result"><div className="convert-result-mode"><CheckCircle2 size={14} />{t(item.result.remuxWithoutReencoding ? "convertRemux" : "convertReencode")}</div><div className="convert-result-grid"><span><small>{t("convertOriginalFormat")}</small><strong>{item.result.originalFormat}</strong></span><span><small>{t("convertFinalFormat")}</small><strong>{item.result.finalFormat}</strong></span><span><small>{t("convertOriginalVideoCodec")}</small><strong>{item.result.originalVideoCodec}</strong></span><span><small>{t("finalCodec")}</small><strong>{item.result.finalVideoCodec}</strong></span><span><small>{t("convertOriginalAudioCodec")}</small><strong>{item.result.originalAudioCodec ?? t("noAudio")}</strong></span><span><small>{t("convertPlannedAudioCodec")}</small><strong>{item.result.finalAudioCodec ?? t("noAudio")}</strong></span><span><small>{t("finalResolution")}</small><strong>{item.result.width} × {item.result.height}</strong></span><span><small>{t("convertVideoFrameRate")}</small><strong>{item.result.framesPerSecond.toFixed(3)} fps</strong></span><span><small>{t("originalSize")}</small><strong>{formatBytes(item.result.originalSize)}</strong></span><span><small>{t("convertFinalSize")}</small><strong>{formatBytes(item.result.finalSize)}</strong></span><span><small>{t("processingDuration")}</small><strong>{formatDuration(item.result.processingDurationSeconds)}</strong></span>{item.result.selectedQuality !== null && <span><small>{t("convertVideoQuality")}</small><strong>{item.result.selectedQuality}</strong></span>}</div><div className="video-result-location"><FolderOpen size={13} /><span title={item.result.outputPath}>{item.result.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => setPreviewResult(item.result!)}><Play size={13} />{t("previewVideo")}</button><button className="text-button" type="button" onClick={() => void openPath(item.result!.outputPath)}><Video size={13} />{t("openVideo")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(item.result!.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></div>}
         </div><button className="video-remove-button" disabled={isProcessing} type="button" onClick={() => removeItem(item.path)}><Trash2 size={15} /><span>{t("remove")}</span></button>
       </article>)}</div>}
     </section>
 
     <div className={`convert-video-settings-grid ${isProcessing ? "disabled" : ""}`}>
-      <section className="compress-panel convert-video-format-panel"><div className="video-section-title"><RefreshCw size={18} /><div><h2>{t("convertOutputFormat")}</h2><p>{t("convertOutputFormatHint")}</p></div></div><div className="convert-format-options">{(["mp4", "webm", "mov", "mkv"] as OutputFormat[]).map((format) => <button type="button" className={outputFormat === format ? "active" : ""} key={format} onClick={() => setOutputFormat(format)}>{format === "webm" ? "WebM" : format.toUpperCase()}</button>)}</div>
+      <section className="compress-panel convert-video-format-panel"><div className="video-section-title"><RefreshCw size={18} /><div><h2>{t("convertOutputFormat")}</h2><p>{t("convertOutputFormatHint")}</p></div></div><div className="convert-format-options">{outputFormats.map((format) => <button type="button" className={outputFormat === format ? "active" : ""} key={format} onClick={() => setOutputFormat(format)}>{format === "webm" ? "WebM" : format.toUpperCase()}</button>)}</div>
         <label className="convert-select"><span>{t("convertVideoCodec")}</span><select value={videoCodec} onChange={(event) => setVideoCodec(event.target.value as VideoCodec)}>{videoChoices.map((codec) => <option value={codec} key={codec}>{codecLabel(codec, "video")}</option>)}</select></label>
         <label className="convert-select"><span>{t("convertAudioCodec")}</span><select value={audioCodec} onChange={(event) => setAudioCodec(event.target.value as AudioCodec)}>{audioChoices.map((codec) => <option value={codec} key={codec}>{codecLabel(codec, "audio")}</option>)}</select></label>
         <label className="convert-quality"><span><strong>{t("convertVideoQuality")}</strong><b>{quality}</b></span><input type="range" min="1" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></label>
@@ -456,7 +489,6 @@ export function ConvertVideoPage() {
     {!!readyItems.length && <section className="compress-panel convert-plan-panel"><div className="video-section-title"><Clapperboard size={18} /><div><h2>{t("convertPlanTitle")}</h2><p>{t("convertPlanHint")}</p></div></div><div className="convert-plan-list">{readyItems.map((item) => <article className={`convert-plan ${item.plan?.valid ? "valid" : "invalid"}`} key={item.path}><header><strong>{item.name}</strong>{item.plan?.valid ? <span><CheckCircle2 size={13} />{t(item.plan.remuxWithoutReencoding ? "convertRemux" : "convertReencode")}</span> : <span><AlertCircle size={13} />{t(planReasonKeys[item.plan?.reason ?? ""] ?? "convertPlanUnavailable")}</span>}</header><div><span><small>{t("convertOriginalFormat")}</small><strong>{item.format}</strong></span><span><small>{t("convertFinalFormat")}</small><strong>{outputFormat === "webm" ? "WebM" : outputFormat.toUpperCase()}</strong></span><span><small>{t("convertOriginalVideoCodec")}</small><strong>{item.videoCodec}</strong></span><span><small>{t("convertPlannedVideoCodec")}</small><strong>{item.plan?.plannedVideoCodec || "—"}</strong></span><span><small>{t("convertOriginalAudioCodec")}</small><strong>{item.audioCodec ?? t("noAudio")}</strong></span><span><small>{t("convertPlannedAudioCodec")}</small><strong>{item.plan?.plannedAudioCodec ?? t("noAudio")}</strong></span><span><small>{t("convertPlannedResolution")}</small><strong>{resolutionValid ? plannedResolution(item) : "—"}</strong></span><span><small>{t("convertPlannedFrameRate")}</small><strong>{preserveFrameRate ? `${item.framesPerSecond?.toFixed(3)} fps` : frameRateValid ? `${fps.toFixed(3)} fps` : "—"}</strong></span></div></article>)}</div></section>}
 
     <section className="compress-panel video-destination-panel"><div><FolderOpen size={19} /><span><strong>{t("destinationFolder")}</strong><small title={destination ?? ""}>{destination ?? t("videoAutomaticDestination")}</small></span></div><button className="secondary-button" disabled={isProcessing} type="button" onClick={async () => { const selected = await open({ directory: true, multiple: false }); if (typeof selected === "string") setDestination(selected); }}>{t("chooseFolder")}</button></section>
-    {!outputImplemented && <p className="convert-validation convert-format-pending"><AlertCircle size={13} />{t("convertFormatNotImplemented")}</p>}
     {notice && <p className="convert-interface-notice"><CheckCircle2 size={14} />{notice}</p>}
     {activeProgress && <section className="video-progress-panel convert-progress"><div><span>{t(activeProgress.phase === "remuxing" ? "convertRemuxing" : "convertConverting")}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{t("videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })} · {formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small></section>}
     {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelConversion()}><Ban size={19} />{t("convertCancel")}</button> : <button className="run-button convert-video-button" type="button" disabled={!canConvert} onClick={() => void runConversion()}><RefreshCw size={19} />{t("convertVideos")}</button>}
