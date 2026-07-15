@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,7 @@ pub struct VideoCompressionProgress {
     processed_seconds: f64,
     duration_seconds: f64,
     percent: f64,
+    overall_percent: f64,
     phase: String,
     attempt: u8,
 }
@@ -98,6 +99,7 @@ pub struct VideoCompressionResult {
     target_size: Option<u64>,
     initial_video_bitrate_kbps: Option<f64>,
     corrected_video_bitrate_kbps: Option<f64>,
+    audio_bitrate_kbps: Option<f64>,
     attempts: u8,
     target_exceeded: bool,
     pending_confirmation: bool,
@@ -105,6 +107,7 @@ pub struct VideoCompressionResult {
     original_height: u64,
     resolution_reduced_automatically: bool,
     resolution_reduction_reason: Option<String>,
+    processing_duration_seconds: Option<f64>,
     #[serde(skip_serializing)]
     pending_final_base: Option<String>,
 }
@@ -445,6 +448,7 @@ where
                     processed_seconds: processed,
                     duration_seconds: input.duration_seconds,
                     percent,
+                    overall_percent: percent,
                     phase: "encoding".into(),
                     attempt: 1,
                 });
@@ -531,6 +535,7 @@ where
         processed_seconds: input.duration_seconds,
         duration_seconds: input.duration_seconds,
         percent: 100.0,
+        overall_percent: 100.0,
         phase: "encoding".into(),
         attempt: 1,
     });
@@ -559,6 +564,7 @@ where
         target_size: None,
         initial_video_bitrate_kbps: None,
         corrected_video_bitrate_kbps: None,
+        audio_bitrate_kbps: None,
         attempts: 1,
         target_exceeded: false,
         pending_confirmation: false,
@@ -566,6 +572,7 @@ where
         original_height: input.height,
         resolution_reduced_automatically: false,
         resolution_reduction_reason: None,
+        processing_duration_seconds: None,
         pending_final_base: None,
     })
 }
@@ -633,6 +640,7 @@ where
     F: FnMut(VideoCompressionProgress),
     M: FnMut(u8, &Path) -> Result<u64, VideoCompressionError>,
 {
+    let started_at = Instant::now();
     if request.output_format != "mp4" {
         return Err(VideoCompressionError::new(
             "target_webm_not_implemented",
@@ -671,6 +679,12 @@ where
             "The target bitrate could not be calculated.",
         )
     })?;
+    if initial.video_kbps <= 0.0 {
+        return Err(VideoCompressionError::new(
+            "target_bitrate_too_low",
+            "The selected target leaves no usable bitrate for the video stream.",
+        ));
+    }
     let automatic_reduction = request
         .allow_automatic_resolution_reduction
         .unwrap_or(false);
@@ -726,6 +740,7 @@ where
         processed_seconds: 0.0,
         duration_seconds: input.duration_seconds,
         percent: 0.0,
+        overall_percent: 0.0,
         phase: "encodingAttempt1".into(),
         attempt: 1,
     });
@@ -783,6 +798,7 @@ where
             processed_seconds: 0.0,
             duration_seconds: input.duration_seconds,
             percent: 0.0,
+            overall_percent: 50.0,
             phase: "adjustingBitrate".into(),
             attempt: 2,
         });
@@ -801,7 +817,7 @@ where
             &request.path,
             &input.name,
             input.duration_seconds,
-            "adjustingBitrate",
+            "encodingAttempt2",
             2,
             &mut report,
         )?;
@@ -809,7 +825,7 @@ where
         actual_size = measure(2, &temporary)?;
     }
 
-    let target_exceeded = target_exceeded_by_five_percent(actual_size, target_size);
+    let target_exceeded = target_exceeded_by_two_percent(actual_size, target_size);
     let pending_confirmation = target_exceeded && attempts == 2;
     let final_output = if pending_confirmation {
         cleanup.keep(&temporary);
@@ -822,26 +838,23 @@ where
         cleanup.keep(&temporary);
         output
     };
-    let saved_bytes = input.size.saturating_sub(actual_size);
-    let no_size_reduction = actual_size >= input.size;
-    let reduction_percent = if no_size_reduction || input.size == 0 {
-        0.0
-    } else {
-        saved_bytes as f64 / input.size as f64 * 100.0
-    };
+    let (saved_bytes, reduction_percent, no_size_reduction) =
+        target_reduction_metrics(input.size, actual_size);
     report(VideoCompressionProgress {
         path: request.path,
         name: input.name,
         processed_seconds: input.duration_seconds,
         duration_seconds: input.duration_seconds,
         percent: 100.0,
+        overall_percent: 100.0,
         phase: if attempts == 2 {
-            "adjustingBitrate".into()
+            "encodingAttempt2".into()
         } else {
             "encodingAttempt1".into()
         },
         attempt: attempts,
     });
+    let output_has_audio = verified.audio_codec.is_some();
 
     Ok(VideoCompressionResult {
         original_size: input.size,
@@ -879,6 +892,7 @@ where
         target_size: Some(target_size),
         initial_video_bitrate_kbps: Some(initial.video_kbps),
         corrected_video_bitrate_kbps: corrected_bitrate,
+        audio_bitrate_kbps: Some(if output_has_audio { 160.0 } else { 0.0 }),
         attempts,
         target_exceeded,
         pending_confirmation,
@@ -888,6 +902,7 @@ where
         resolution_reduction_reason: resolution
             .reduced
             .then(|| "bitrate_quality_threshold".to_owned()),
+        processing_duration_seconds: Some(started_at.elapsed().as_secs_f64()),
         pending_final_base: pending_confirmation.then_some(base_name),
     })
 }
@@ -1028,6 +1043,10 @@ where
                     processed_seconds: processed,
                     duration_seconds,
                     percent: (processed / duration_seconds * 100.0).clamp(0.0, 99.9),
+                    overall_percent: overall_target_progress(
+                        attempt,
+                        (processed / duration_seconds * 100.0).clamp(0.0, 99.9),
+                    ),
                     phase: phase.to_owned(),
                     attempt,
                 });
@@ -1078,7 +1097,31 @@ fn validate_target_output(
 }
 
 fn target_exceeded_by_five_percent(actual: u64, target: u64) -> bool {
-    actual as f64 > target as f64 * 1.05
+    target > 0 && actual as u128 * 100 > target as u128 * 105
+}
+
+fn target_exceeded_by_two_percent(actual: u64, target: u64) -> bool {
+    target > 0 && actual as u128 * 100 > target as u128 * 102
+}
+
+fn overall_target_progress(attempt: u8, attempt_percent: f64) -> f64 {
+    let bounded = attempt_percent.clamp(0.0, 100.0);
+    if attempt <= 1 {
+        bounded * 0.5
+    } else {
+        50.0 + bounded * 0.5
+    }
+}
+
+fn target_reduction_metrics(original: u64, actual: u64) -> (u64, f64, bool) {
+    let no_size_reduction = actual >= original;
+    let saved = original.saturating_sub(actual);
+    let percent = if no_size_reduction || original == 0 {
+        0.0
+    } else {
+        saved as f64 / original as f64 * 100.0
+    };
+    (saved, percent, no_size_reduction)
 }
 
 fn target_size_label(bytes: u64) -> String {
@@ -1669,6 +1712,98 @@ mod tests {
     }
 
     #[test]
+    fn target_progress_is_coherent_for_one_or_two_encoding_attempts() {
+        assert_eq!(overall_target_progress(1, 0.0), 0.0);
+        assert_eq!(overall_target_progress(1, 50.0), 25.0);
+        assert_eq!(overall_target_progress(1, 100.0), 50.0);
+        assert_eq!(overall_target_progress(2, 0.0), 50.0);
+        assert_eq!(overall_target_progress(2, 50.0), 75.0);
+        assert_eq!(overall_target_progress(2, 100.0), 100.0);
+        assert_eq!(overall_target_progress(2, 150.0), 100.0);
+    }
+
+    #[test]
+    fn target_outcomes_use_two_percent_tolerance_and_never_report_negative_savings() {
+        assert!(!target_exceeded_by_two_percent(1_020_000, 1_000_000));
+        assert!(target_exceeded_by_two_percent(1_020_001, 1_000_000));
+        assert_eq!(target_reduction_metrics(1_000, 1_100), (0, 0.0, true));
+        assert_eq!(target_reduction_metrics(1_000, 500), (500, 50.0, false));
+    }
+
+    #[test]
+    fn target_batch_continues_after_a_corrupt_video_and_preserves_every_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let first = temp.path().join("batch-one.mp4");
+        let corrupt = temp.path().join("batch-corrupt.mp4");
+        let third = temp.path().join("batch-three.mp4");
+        let fourth = temp.path().join("batch-four.avi");
+        create_source(&first, "mp4");
+        fs::write(&corrupt, b"not a video").unwrap();
+        create_silent_source(&third);
+        create_source(&fourth, "avi");
+        let originals = [&first, &corrupt, &third, &fourth].map(|path| fs::read(path).unwrap());
+        let state = VideoCompressionState::default();
+        let mut completed = 0;
+        let mut failed = 0;
+
+        for path in [&first, &corrupt, &third, &fourth] {
+            match compress_with_tools(
+                target_size_request(path, &output_dir, 96 * 1024),
+                &bundled_tool("ffmpeg"),
+                &bundled_tool("ffprobe"),
+                &library_dir(),
+                &state,
+                |_| {},
+            ) {
+                Ok(result) => {
+                    completed += 1;
+                    assert!(Path::new(&result.output_path).is_file());
+                }
+                Err(_) => failed += 1,
+            }
+        }
+
+        assert_eq!((completed, failed), (3, 1));
+        for (path, original) in [&first, &corrupt, &third, &fourth]
+            .into_iter()
+            .zip(originals)
+        {
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+        assert!(fs::read_dir(&output_dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp.")));
+    }
+
+    #[test]
+    fn target_impossible_fails_before_encoding_and_leaves_no_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let source = temp.path().join("too-small.mp4");
+        create_resolution_source(&source, 1280, 720);
+        let original = fs::read(&source).unwrap();
+        let mut request = target_size_request(&source, &output_dir, 20 * 1024);
+        request.allow_automatic_resolution_reduction = Some(true);
+        let error = compress_with_tools(
+            request,
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &VideoCompressionState::default(),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "target_bitrate_too_low");
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read_dir(&output_dir).unwrap().count(), 0);
+    }
+
+    #[test]
     fn target_mp4_really_encodes_audio_silent_unique_valid_outputs_and_preserves_originals() {
         let temp = tempfile::tempdir().unwrap();
         let output_dir = temp.path().join("outputs");
@@ -1678,6 +1813,7 @@ mod tests {
         let original = fs::read(&source).unwrap();
         let state = VideoCompressionState::default();
         let target = 96 * 1024;
+        let mut first_progress = Vec::new();
 
         let first = compress_with_tools(
             target_size_request(&source, &output_dir, target),
@@ -1685,7 +1821,7 @@ mod tests {
             &bundled_tool("ffprobe"),
             &library_dir(),
             &state,
-            |_| {},
+            |event| first_progress.push(event),
         )
         .unwrap();
         let duplicate = compress_with_tools(
@@ -1716,6 +1852,14 @@ mod tests {
         assert_eq!(muted.audio_codec, None);
         assert!(first.compressed_size > 0 && first.attempts <= 2);
         assert_eq!(first.target_size, Some(target));
+        assert_eq!(first.attempts, 1);
+        assert!(first_progress
+            .iter()
+            .any(|event| event.phase == "encodingAttempt1" && event.percent > 0.0));
+        assert_eq!(
+            first_progress.last().map(|event| event.overall_percent),
+            Some(100.0)
+        );
         let verified = inspect_video_with_tools(
             Path::new(&first.output_path),
             &bundled_tool("ffprobe"),
@@ -1793,6 +1937,8 @@ mod tests {
         let source = temp.path().join("long-target.mp4");
         create_long_source(&source);
         let original = fs::read(&source).unwrap();
+        let retry_source = temp.path().join("retry.mp4");
+        create_silent_source(&retry_source);
 
         for attempt in [1_u8, 2] {
             let output = temp.path().join(format!(".attempt-{attempt}.tmp.mp4"));
@@ -1849,6 +1995,32 @@ mod tests {
             let error = worker.join().unwrap().unwrap_err();
             assert_eq!(error.code, "compression_cancelled");
             assert!(!output.exists());
+            if attempt == 2 {
+                let retry_output = temp.path().join("retry-output.mp4");
+                let retry_request = target_size_request(&retry_source, temp.path(), 96 * 1024);
+                let retry_args = target_mp4_ffmpeg_args(
+                    &retry_request,
+                    &retry_source,
+                    &retry_output,
+                    500.0,
+                    None,
+                );
+                run_target_attempt(
+                    &bundled_tool("ffmpeg"),
+                    &library_dir(),
+                    &state,
+                    &retry_args,
+                    &retry_request.path,
+                    "retry.mp4",
+                    1.0,
+                    "encodingAttempt1",
+                    1,
+                    &mut |_| {},
+                )
+                .unwrap();
+                assert!(retry_output.is_file());
+                fs::remove_file(retry_output).unwrap();
+            }
         }
         assert_eq!(fs::read(&source).unwrap(), original);
         assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
@@ -1870,6 +2042,7 @@ mod tests {
         let target = 230 * 1024;
         let mut corrective_request = target_size_request(&source, &output_dir, target);
         corrective_request.allow_automatic_resolution_reduction = Some(true);
+        let mut corrective_progress = Vec::new();
 
         let corrected = compress_target_mp4_with_measure(
             corrective_request.clone(),
@@ -1877,7 +2050,7 @@ mod tests {
             &bundled_tool("ffprobe"),
             &library_dir(),
             &state,
-            |_| {},
+            |event| corrective_progress.push(event),
             |attempt, path| {
                 Ok(if attempt == 1 {
                     target * 110 / 100
@@ -1894,6 +2067,21 @@ mod tests {
         assert_eq!((corrected.width, corrected.height), (640, 360));
         assert!(corrected.resolution_reduced_automatically);
         assert!(Path::new(&corrected.output_path).is_file());
+        assert!(corrective_progress
+            .iter()
+            .any(|event| event.phase == "adjustingBitrate" && event.overall_percent == 50.0));
+        assert!(corrective_progress
+            .iter()
+            .any(|event| event.phase == "encodingAttempt2" && event.percent > 0.0));
+        assert!(corrective_progress
+            .windows(2)
+            .all(|events| events[0].overall_percent <= events[1].overall_percent));
+        assert_eq!(
+            corrective_progress
+                .last()
+                .map(|event| event.overall_percent),
+            Some(100.0)
+        );
 
         let persistent = compress_target_mp4_with_measure(
             corrective_request,

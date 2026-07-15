@@ -920,6 +920,9 @@ button { color: inherit; }
 .video-status.analyzing { color: #8b6a3b; background: #fff7e9; }
 .video-status.ready { color: #3d7862; background: #eaf7f1; }
 .video-status.processing { color: #7a5a2f; background: #fff4df; }
+.video-status.waiting { color: #66736d; background: #f0f3f2; }
+.video-status.encoding { color: #7a5a2f; background: #fff4df; }
+.video-status.adjusting { color: #76518c; background: #f5edfa; }
 .video-status.completed { color: #2f7358; background: #e4f6ee; }
 .video-status.cancelled { color: #736b65; background: #f1efed; }
 .video-status.failed { color: #9b4652; background: #fff0f2; }
@@ -976,6 +979,10 @@ button { color: inherit; }
 .video-target-resolution-preview span { direction: ltr; unicode-bidi: isolate; }
 .video-resolution-warning { display: flex; align-items: center; gap: 5px; margin: 7px 2px 0; color: #8d6a46; font-size: 6.8px; line-height: 1.4; }
 .video-resolution-reduced { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 7px 9px; border: 1px solid #c9dfd5; border-radius: 7px; background: #f2faf6; color: #4f7965; font-size: 7px; }
+.video-target-outcome { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid #dce9e2; color: #42715b; background: #f1faf5; font-size: 7px; }
+.video-target-outcome span { color: #70847a; font-weight: 500; }
+.video-target-outcome.exceeded { border-color: #ead1ba; color: #995a32; background: #fff6ee; }
+.video-target-outcome.exceeded span { color: #8d735f; }
 .video-target-confirmation { margin-top: 8px; padding: 9px; border: 1px solid #e6c98e; border-radius: 8px; background: #fff9e9; }
 .video-target-confirmation p { margin: 0; color: #815b24; font-size: 7px; font-weight: 700; }
 .video-target-confirmation > div { display: flex; justify-content: flex-end; gap: 6px; margin-top: 7px; }
@@ -1039,6 +1046,8 @@ button { color: inherit; }
 .video-progress-panel b { color: #a0642f; font-size: 10px; }
 .video-progress-panel progress { width: 100%; height: 7px; margin-top: 9px; overflow: hidden; border: 0; border-radius: 99px; accent-color: #a96b34; }
 .video-progress-panel small { display: block; margin-top: 4px; direction: ltr; color: #9a876d; font-size: 6.5px; text-align: end; }
+.video-progress-details { display: flex !important; grid-template-columns: none !important; justify-content: space-between; gap: 12px; }
+.video-progress-details small { unicode-bidi: isolate; }
 .video-cancel-button { color: #fff; background: #a5525a; }
 .video-cancel-button:hover { background: #8d424b; }
 .video-preview-backdrop { position: fixed; z-index: 1200; inset: 0; display: grid; padding: 28px; place-items: center; background: rgba(20, 27, 24, .78); backdrop-filter: blur(4px); }

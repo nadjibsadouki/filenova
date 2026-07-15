@@ -37,7 +37,7 @@ import {
 } from "../utils/videoTargetSize";
 
 type VideoMode = "recommended" | "targetQuality" | "targetFileSize";
-type VideoStatus = "analyzing" | "ready" | "processing" | "completed" | "cancelled" | "failed";
+type VideoStatus = "analyzing" | "ready" | "processing" | "waiting" | "encoding" | "adjusting" | "completed" | "cancelled" | "failed";
 type OutputFormat = "mp4" | "webm";
 
 interface VideoInfo {
@@ -93,6 +93,7 @@ interface VideoCompressionResult {
   targetSize: number | null;
   initialVideoBitrateKbps: number | null;
   correctedVideoBitrateKbps: number | null;
+  audioBitrateKbps: number | null;
   attempts: number;
   targetExceeded: boolean;
   pendingConfirmation: boolean;
@@ -100,6 +101,7 @@ interface VideoCompressionResult {
   originalHeight: number;
   resolutionReducedAutomatically: boolean;
   resolutionReductionReason: string | null;
+  processingDurationSeconds: number | null;
 }
 
 interface VideoCompressionProgress {
@@ -108,7 +110,8 @@ interface VideoCompressionProgress {
   processedSeconds: number;
   durationSeconds: number;
   percent: number;
-  phase: "encoding" | "encodingAttempt1" | "adjustingBitrate";
+  overallPercent: number;
+  phase: "encoding" | "encodingAttempt1" | "adjustingBitrate" | "encodingAttempt2";
   attempt: number;
 }
 
@@ -134,7 +137,7 @@ const videoErrorTranslations: Record<string, TranslationKey> = {
   mode_not_implemented: "videoModeNotImplemented",
   delete_failed: "videoDeleteFailed",
   invalid_target_size: "targetSizeNonNumeric",
-  target_bitrate_too_low: "targetSizeTooSmall",
+  target_bitrate_too_low: "targetSizeImpossible",
   target_webm_not_implemented: "targetWebmNotImplemented",
   automatic_resolution_not_implemented: "automaticResolutionNotImplemented",
 };
@@ -160,6 +163,10 @@ function formatDuration(seconds: number) {
   return hours > 0
     ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`
     : `${minutes}:${remainingSeconds}`;
+}
+
+function targetVariancePercent(actual: number, target: number) {
+  return target > 0 ? (actual - target) / target * 100 : 0;
 }
 
 function estimateVideoSize(size: number, quality: number, outputFormat: OutputFormat, removeAudio: boolean) {
@@ -294,7 +301,13 @@ export function CompressVideoPage() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     listen<VideoCompressionProgress>("video-compression-progress", (event) => {
-      if (!disposed) setActiveProgress(event.payload);
+      if (!disposed) {
+        setActiveProgress(event.payload);
+        if (event.payload.phase !== "encoding") {
+          const status: VideoStatus = event.payload.phase === "encodingAttempt1" ? "encoding" : "adjusting";
+          setItems((current) => current.map((item) => item.path === event.payload.path ? { ...item, status } : item));
+        }
+      }
     }).then((cleanup) => {
       if (disposed) cleanup(); else unlisten = cleanup;
     });
@@ -348,7 +361,11 @@ export function CompressVideoPage() {
     setItems([]);
   }
 
-  const readyItems = items.filter((item) => item.status === "ready");
+  const readyItems = items.filter((item) =>
+    !item.result
+    && item.durationSeconds !== undefined
+    && (item.status === "ready" || (mode === "targetFileSize" && (item.status === "cancelled" || item.status === "failed"))),
+  );
   const totalInputSize = readyItems.reduce((total, item) => total + (item.size ?? 0), 0);
   const parsedTargetSize = Number(targetSizeInput);
   const targetBytesPerVideo = Number.isFinite(parsedTargetSize) && parsedTargetSize > 0
@@ -445,15 +462,24 @@ export function CompressVideoPage() {
     setPageError(null);
     setBatchPosition({ current: 1, total: queue.length });
     cancellationRequested.current = false;
+    if (mode === "targetFileSize") {
+      const queuedPaths = new Set(queue.map((item) => item.path));
+      setItems((current) => current.map((entry) => queuedPaths.has(entry.path) ? {
+        ...entry,
+        status: "waiting",
+        errorCode: undefined,
+        errorMessage: undefined,
+      } : entry));
+    }
 
     for (let index = 0; index < queue.length; index += 1) {
       const item = queue[index];
       if (cancellationRequested.current) break;
       setBatchPosition({ current: index + 1, total: queue.length });
-      setActiveProgress({ path: item.path, name: item.name, processedSeconds: 0, durationSeconds: item.durationSeconds ?? 0, percent: 0, phase: mode === "targetFileSize" ? "encodingAttempt1" : "encoding", attempt: 1 });
+      setActiveProgress({ path: item.path, name: item.name, processedSeconds: 0, durationSeconds: item.durationSeconds ?? 0, percent: 0, overallPercent: 0, phase: mode === "targetFileSize" ? "encodingAttempt1" : "encoding", attempt: 1 });
       setItems((current) => current.map((entry) => entry.path === item.path ? {
         ...entry,
-        status: "processing",
+        status: mode === "targetFileSize" ? "encoding" : "processing",
         errorCode: undefined,
         errorMessage: undefined,
         result: undefined,
@@ -494,6 +520,13 @@ export function CompressVideoPage() {
       }
     }
 
+    if (cancellationRequested.current) {
+      setItems((current) => current.map((entry) => entry.status === "waiting" ? {
+        ...entry,
+        status: "cancelled",
+        errorCode: "compression_cancelled",
+      } : entry));
+    }
     setIsProcessing(false);
     setActiveProgress(null);
     cancellationRequested.current = false;
@@ -594,8 +627,8 @@ export function CompressVideoPage() {
                   <div className="video-file-title">
                     <div><strong title={item.path}>{item.name}</strong><small title={item.path}>{item.path}</small></div>
                     <div className={`video-status ${item.status}`}>
-                      {item.status === "analyzing" || item.status === "processing" ? <LoaderCircle className="spin" size={13} /> : item.status === "ready" || item.status === "completed" ? <CheckCircle2 size={13} /> : item.status === "cancelled" ? <Ban size={13} /> : <AlertCircle size={13} />}
-                      <span>{t(item.status === "analyzing" ? "analyzingVideo" : item.status === "processing" ? "videoCompressing" : item.status === "ready" ? "videoReady" : item.status === "completed" ? "videoCompleted" : item.status === "cancelled" ? "videoCancelled" : "videoFailed")}</span>
+                      {item.status === "analyzing" || item.status === "processing" || item.status === "encoding" || item.status === "adjusting" ? <LoaderCircle className="spin" size={13} /> : item.status === "ready" || item.status === "completed" ? <CheckCircle2 size={13} /> : item.status === "cancelled" ? <Ban size={13} /> : item.status === "waiting" ? <CircleGauge size={13} /> : <AlertCircle size={13} />}
+                      <span>{t(item.status === "analyzing" ? "analyzingVideo" : item.status === "processing" ? "videoCompressing" : item.status === "waiting" ? "videoWaiting" : item.status === "encoding" ? "videoEncoding" : item.status === "adjusting" ? "videoAdjusting" : item.status === "ready" ? "videoReady" : item.status === "completed" ? "videoCompleted" : item.status === "cancelled" ? "videoCancelled" : "videoFailed")}</span>
                     </div>
                   </div>
 
@@ -612,8 +645,13 @@ export function CompressVideoPage() {
                     </div>
                   )}
                   {item.result && <div className={`video-result-strip ${item.result.noSizeReduction || item.result.targetExceeded ? "no-reduction" : ""}`}>
+                    {item.result.targetSize !== null && <div className={`video-target-outcome ${item.result.targetExceeded ? "exceeded" : "reached"}`}>
+                      {item.result.targetExceeded ? <AlertCircle size={15} /> : <CheckCircle2 size={15} />}
+                      <strong>{t(item.result.targetExceeded ? "targetExceeded" : "targetReached")}</strong>
+                      <span>{t("targetAccuracyDisclaimer")}</span>
+                    </div>}
                     {item.result.resolutionReducedAutomatically && <div className="video-resolution-reduced"><CheckCircle2 size={15} /><strong>{t("resolutionReducedAutomatically")}</strong></div>}
-                    {item.result.targetExceeded && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("targetExceeded")}</strong><span>{t("targetExceededHint")}</span></div>}
+                    {item.result.targetExceeded && item.result.pendingConfirmation && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("targetExceeded")}</strong><span>{t("targetExceededHint")}</span></div>}
                     {item.result.noSizeReduction && !item.result.pendingConfirmation && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("noSizeReduction")}</strong><span>{t("noSizeReductionHint")}</span></div>}
                     <div className="video-result-metrics">
                       <span><small>{t("originalSize")}</small><strong>{formatBytes(item.result.originalSize)}</strong></span>
@@ -627,10 +665,15 @@ export function CompressVideoPage() {
                       <span title={item.result.encodingSetting}><small>{t("encodingSetting")}</small><strong>{item.result.encodingSetting}</strong></span>
                       {item.result.estimatedSize !== null && <span><small>{t("estimatedSizeResult")}</small><strong>{formatBytes(item.result.estimatedSize)}</strong></span>}
                       {item.result.targetSize !== null && <span><small>{t("targetSizeResult")}</small><strong>{formatBytes(item.result.targetSize)}</strong></span>}
+                      {item.result.targetSize !== null && <span><small>{t("targetDifference")}</small><strong>{item.result.compressedSize >= item.result.targetSize ? "+" : "−"}{formatBytes(Math.abs(item.result.compressedSize - item.result.targetSize))}</strong></span>}
+                      {item.result.targetSize !== null && <span><small>{t("targetVariance")}</small><strong>{targetVariancePercent(item.result.compressedSize, item.result.targetSize) >= 0 ? "+" : ""}{targetVariancePercent(item.result.compressedSize, item.result.targetSize).toFixed(1)}%</strong></span>}
                       {item.result.initialVideoBitrateKbps !== null && <span><small>{t("initialVideoBitrate")}</small><strong>{formatBitrate(item.result.initialVideoBitrateKbps)}</strong></span>}
                       {item.result.correctedVideoBitrateKbps !== null && <span><small>{t("correctedVideoBitrate")}</small><strong>{formatBitrate(item.result.correctedVideoBitrateKbps)}</strong></span>}
+                      {item.result.audioBitrateKbps !== null && <span><small>{t("estimatedAudioBitrate")}</small><strong>{formatBitrate(item.result.audioBitrateKbps)}</strong></span>}
                       {item.result.targetSize !== null && <span><small>{t("encodingAttempts")}</small><strong>{item.result.attempts}</strong></span>}
                       {item.result.targetSize !== null && <span><small>{t("originalResolution")}</small><strong>{item.result.originalWidth} × {item.result.originalHeight}</strong></span>}
+                      {item.result.targetSize !== null && <span><small>{t("automaticReductionApplied")}</small><strong>{t(item.result.resolutionReducedAutomatically ? "automaticReductionYes" : "automaticReductionNo")}</strong></span>}
+                      {item.result.processingDurationSeconds !== null && <span><small>{t("processingDuration")}</small><strong>{formatDuration(item.result.processingDurationSeconds)}</strong></span>}
                       {item.result.resolutionReducedAutomatically && <span><small>{t("resolutionReductionReason")}</small><strong>{t("resolutionReductionBitrateReason")}</strong></span>}
                       {item.result.estimateDifference !== null && <span><small>{t("estimateDifference")}</small><strong>{item.result.estimateDifference >= 0 ? "+" : "−"}{formatBytes(Math.abs(item.result.estimateDifference))}</strong></span>}
                     </div>
@@ -720,7 +763,11 @@ export function CompressVideoPage() {
         <div><span>{t("totalInputSize")}</span><strong>{totalInputSize ? formatBytes(totalInputSize) : "—"}</strong><small>{t("videoFilesReady", { count: readyItems.length })}</small></div>
       </section>
 
-      {activeProgress && <section className="video-progress-panel"><div><span>{t(activeProgress.phase === "encodingAttempt1" ? "encodingAttemptOne" : activeProgress.phase === "adjustingBitrate" ? "adjustingBitrate" : "videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small></section>}
+      {activeProgress && <section className="video-progress-panel">
+        <div><span>{t(activeProgress.phase === "encodingAttempt1" ? "encodingAttemptOne" : activeProgress.phase === "adjustingBitrate" ? "adjustingBitrate" : activeProgress.phase === "encodingAttempt2" ? "encodingAttemptTwo" : "videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div>
+        <progress max="100" value={activeProgress.overallPercent} />
+        <div className="video-progress-details"><small>{t("attemptProgress")}: {activeProgress.percent.toFixed(1)}% · {formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small><small>{t("overallProgress")}: {activeProgress.overallPercent.toFixed(1)}% · {t("videosRemaining", { count: Math.max(0, batchPosition.total - batchPosition.current) })}</small></div>
+      </section>}
       {pageError && <div className="page-error"><AlertCircle size={16} />{pageError}</div>}
       {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelCompression()}><Ban size={19} />{t("cancelVideoCompression")}</button> : <button className="run-button video-compress-button" type="button" disabled={targetCompressionBlocked || !readyItems.length} title={targetCompressionBlocked ? t("targetSettingsInvalid") : undefined} onClick={() => void runCompression()}><Clapperboard size={19} />{t("compressVideos")}</button>}
 
