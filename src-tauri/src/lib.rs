@@ -16,6 +16,7 @@ use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
 use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_output};
 use resizing::resize_image;
+use video_tools::inspect_video;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -39,7 +40,8 @@ pub fn run() {
             split_pdf,
             inspect_pdf_for_images,
             pdf_to_images,
-            validate_pdf_image_output
+            validate_pdf_image_output,
+            inspect_video
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

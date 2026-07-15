@@ -7,6 +7,7 @@ import { ConvertImagesPage } from "./pages/ConvertImagesPage";
 import { ResizeImagesPage } from "./pages/ResizeImagesPage";
 import { PdfToolsPage } from "./pages/PdfToolsPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
+import { CompressVideoPage } from "./pages/CompressVideoPage";
 
 function App() {
   const [activePage, setActivePage] = useState<PageId>("home");
@@ -26,6 +27,8 @@ function App() {
           <ResizeImagesPage />
         ) : activePage === "pdf-tools" ? (
           <PdfToolsPage />
+        ) : activePage === "video-tools" ? (
+          <CompressVideoPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}
