@@ -2,6 +2,18 @@ const MIN_SAFETY_MARGIN: f64 = 0.04;
 const MAX_SAFETY_MARGIN: f64 = 0.06;
 const MAX_TARGET_SIZE_BYTES: f64 = 100.0 * 1024.0 * 1024.0 * 1024.0;
 pub(crate) const TARGET_SIZE_SAFETY_MARGIN: f64 = 0.06;
+/// Conservative empirical floor for OpenH264 bitrate allocation. Synthetic motion samples at
+/// 24–30 fps are used in the real encoding tests; this is a selection heuristic, not a quality
+/// guarantee. Values below it trigger the next smaller resolution candidate.
+pub(crate) const MIN_OPENH264_BITS_PER_PIXEL_PER_FRAME: f64 = 0.08;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TargetResolutionChoice {
+    pub width: u64,
+    pub height: u64,
+    pub bits_per_pixel_per_frame: f64,
+    pub reduced: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetSizeUnit {
@@ -139,6 +151,105 @@ pub(crate) fn corrected_video_bitrate_kbps(
     Some(first_video_kbps * target_bytes as f64 / actual_bytes as f64 * 0.97)
 }
 
+pub(crate) fn bits_per_pixel_per_frame(
+    video_bitrate_kbps: f64,
+    width: u64,
+    height: u64,
+    frames_per_second: f64,
+) -> Option<f64> {
+    if !video_bitrate_kbps.is_finite()
+        || video_bitrate_kbps <= 0.0
+        || width == 0
+        || height == 0
+        || !frames_per_second.is_finite()
+        || frames_per_second <= 0.0
+    {
+        return None;
+    }
+    Some(video_bitrate_kbps * 1000.0 / (width as f64 * height as f64 * frames_per_second))
+}
+
+fn fit_even_within(width: u64, height: u64, max_width: u64, max_height: u64) -> (u64, u64) {
+    let scale = (max_width as f64 / width as f64)
+        .min(max_height as f64 / height as f64)
+        .min(1.0);
+    let even = |value: f64| ((value.floor() as u64).max(2) / 2) * 2;
+    (even(width as f64 * scale), even(height as f64 * scale))
+}
+
+pub(crate) fn choose_target_resolution(
+    original_width: u64,
+    original_height: u64,
+    frames_per_second: f64,
+    video_bitrate_kbps: f64,
+    automatic_reduction: bool,
+) -> Option<TargetResolutionChoice> {
+    if original_width == 0 || original_height == 0 {
+        return None;
+    }
+    let original = fit_even_within(
+        original_width,
+        original_height,
+        original_width,
+        original_height,
+    );
+    let original_bpppf = bits_per_pixel_per_frame(
+        video_bitrate_kbps,
+        original.0,
+        original.1,
+        frames_per_second,
+    )?;
+    if !automatic_reduction {
+        return Some(TargetResolutionChoice {
+            width: original.0,
+            height: original.1,
+            bits_per_pixel_per_frame: original_bpppf,
+            reduced: false,
+        });
+    }
+
+    let portrait = original_height > original_width;
+    let standard = [(1920, 1080), (1280, 720), (854, 480), (640, 360)];
+    let mut candidates = vec![original];
+    for (landscape_width, landscape_height) in standard {
+        let bounds = if portrait {
+            (landscape_height, landscape_width)
+        } else {
+            (landscape_width, landscape_height)
+        };
+        let candidate = fit_even_within(original_width, original_height, bounds.0, bounds.1);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    let mut selected = *candidates.last().unwrap_or(&original);
+    let mut selected_bpppf = bits_per_pixel_per_frame(
+        video_bitrate_kbps,
+        selected.0,
+        selected.1,
+        frames_per_second,
+    )?;
+    for candidate in candidates {
+        let bpppf = bits_per_pixel_per_frame(
+            video_bitrate_kbps,
+            candidate.0,
+            candidate.1,
+            frames_per_second,
+        )?;
+        if bpppf >= MIN_OPENH264_BITS_PER_PIXEL_PER_FRAME {
+            selected = candidate;
+            selected_bpppf = bpppf;
+            break;
+        }
+    }
+    Some(TargetResolutionChoice {
+        width: selected.0,
+        height: selected.1,
+        bits_per_pixel_per_frame: selected_bpppf,
+        reduced: selected != original,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +334,46 @@ mod tests {
         let corrected = corrected_video_bitrate_kbps(1_000.0, 10_000_000, 12_000_000).unwrap();
         assert!((corrected - 808.333_333).abs() < 0.001);
         assert!(corrected_video_bitrate_kbps(0.0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn calculates_bits_per_pixel_per_frame() {
+        let value = bits_per_pixel_per_frame(2_000.0, 1280, 720, 30.0).unwrap();
+        assert!((value - 0.072_337_96).abs() < 0.000_001);
+        assert!(bits_per_pixel_per_frame(0.0, 1280, 720, 30.0).is_none());
+    }
+
+    #[test]
+    fn disabled_resolution_reduction_preserves_original_even_dimensions() {
+        let choice = choose_target_resolution(1919, 1079, 30.0, 1_000.0, false).unwrap();
+        assert_eq!((choice.width, choice.height), (1918, 1078));
+        assert!(!choice.reduced);
+    }
+
+    #[test]
+    fn selects_4k_to_1080p_and_1080p_to_720p_at_conservative_bitrate() {
+        let four_k = choose_target_resolution(3840, 2160, 30.0, 5_000.0, true).unwrap();
+        assert_eq!((four_k.width, four_k.height), (1920, 1080));
+        let full_hd = choose_target_resolution(1920, 1080, 30.0, 2_500.0, true).unwrap();
+        assert_eq!((full_hd.width, full_hd.height), (1280, 720));
+    }
+
+    #[test]
+    fn adapts_vertical_candidates_without_changing_orientation() {
+        let choice = choose_target_resolution(2160, 3840, 30.0, 5_000.0, true).unwrap();
+        assert_eq!((choice.width, choice.height), (1080, 1920));
+        assert!(choice.height > choice.width);
+    }
+
+    #[test]
+    fn never_enlarges_small_video_and_preserves_ratio_with_even_dimensions() {
+        let choice = choose_target_resolution(500, 280, 30.0, 100.0, true).unwrap();
+        assert_eq!((choice.width, choice.height), (500, 280));
+        assert!(!choice.reduced);
+        let ratio = choose_target_resolution(4000, 3000, 30.0, 2_500.0, true).unwrap();
+        assert_eq!(ratio.width % 2, 0);
+        assert_eq!(ratio.height % 2, 0);
+        assert!((ratio.width as f64 / ratio.height as f64 - 4.0 / 3.0).abs() < 0.01);
+        assert!(ratio.width <= 4000 && ratio.height <= 3000);
     }
 }

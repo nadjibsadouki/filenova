@@ -970,6 +970,12 @@ button { color: inherit; }
 .video-target-estimates small { color: #87968f; font-size: 6.2px; }
 .video-target-estimates strong { margin-top: 4px; direction: ltr; color: #456657; font-size: 8px; unicode-bidi: isolate; }
 .video-target-validation, .video-low-quality-warning { display: flex; align-items: center; gap: 5px; margin: 7px 2px 0; color: #a44b3d; font-size: 6.8px; line-height: 1.4; }
+.video-target-resolution-preview { display: grid; gap: 5px; margin-top: 8px; }
+.video-target-resolution-preview > div { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 9px; padding: 7px 8px; border: 1px solid #e2e9e5; border-radius: 7px; background: #fff; color: #687a71; font-size: 6.7px; }
+.video-target-resolution-preview strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #50645a; }
+.video-target-resolution-preview span { direction: ltr; unicode-bidi: isolate; }
+.video-resolution-warning { display: flex; align-items: center; gap: 5px; margin: 7px 2px 0; color: #8d6a46; font-size: 6.8px; line-height: 1.4; }
+.video-resolution-reduced { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 7px 9px; border: 1px solid #c9dfd5; border-radius: 7px; background: #f2faf6; color: #4f7965; font-size: 7px; }
 .video-target-confirmation { margin-top: 8px; padding: 9px; border: 1px solid #e6c98e; border-radius: 8px; background: #fff9e9; }
 .video-target-confirmation p { margin: 0; color: #815b24; font-size: 7px; font-weight: 700; }
 .video-target-confirmation > div { display: flex; justify-content: flex-end; gap: 6px; margin-top: 7px; }

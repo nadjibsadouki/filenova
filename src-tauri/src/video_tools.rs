@@ -21,6 +21,7 @@ pub struct VideoInfo {
     pub(crate) duration_seconds: f64,
     pub(crate) width: u64,
     pub(crate) height: u64,
+    pub(crate) frames_per_second: f64,
     pub(crate) size: u64,
     pub(crate) video_codec: String,
     pub(crate) audio_codec: Option<String>,
@@ -252,6 +253,11 @@ pub(crate) fn inspect_video_with_tools(
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(0.0);
+    let frames_per_second = video["avg_frame_rate"]
+        .as_str()
+        .or_else(|| video["r_frame_rate"].as_str())
+        .and_then(parse_frame_rate)
+        .unwrap_or(30.0);
     let video_codec = video["codec_name"]
         .as_str()
         .unwrap_or("unknown")
@@ -277,11 +283,20 @@ pub(crate) fn inspect_video_with_tools(
         duration_seconds,
         width,
         height,
+        frames_per_second,
         size: metadata.len(),
         video_codec,
         audio_codec,
         thumbnail_data,
     })
+}
+
+fn parse_frame_rate(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
+    let result = numerator / denominator;
+    (result.is_finite() && result > 0.0).then_some(result)
 }
 
 fn display_rotation(stream: &serde_json::Value) -> i64 {
@@ -432,6 +447,7 @@ mod tests {
             .unwrap();
 
             assert_eq!((info.width, info.height), (320, 180));
+            assert!((info.frames_per_second - 5.0).abs() < 0.01);
             assert_eq!(info.format, format.to_ascii_uppercase());
             assert!(info.duration_seconds >= 0.9);
             assert_eq!(info.video_codec, "MPEG4");

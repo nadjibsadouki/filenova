@@ -26,10 +26,12 @@ import {
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 import {
+  chooseTargetResolution,
   calculateTargetBitrates,
   estimatedReductionPercent,
   targetSizeToBytes,
   validateTargetSize,
+  MIN_OPENH264_BITS_PER_PIXEL_PER_FRAME,
   type TargetSizeUnit,
   type TargetSizeValidationCode,
 } from "../utils/videoTargetSize";
@@ -45,6 +47,7 @@ interface VideoInfo {
   durationSeconds: number;
   width: number;
   height: number;
+  framesPerSecond: number;
   size: number;
   videoCodec: string;
   audioCodec: string | null;
@@ -59,6 +62,7 @@ interface VideoItem {
   durationSeconds?: number;
   width?: number;
   height?: number;
+  framesPerSecond?: number;
   size?: number;
   videoCodec?: string;
   audioCodec?: string | null;
@@ -92,6 +96,10 @@ interface VideoCompressionResult {
   attempts: number;
   targetExceeded: boolean;
   pendingConfirmation: boolean;
+  originalWidth: number;
+  originalHeight: number;
+  resolutionReducedAutomatically: boolean;
+  resolutionReductionReason: string | null;
 }
 
 interface VideoCompressionProgress {
@@ -244,6 +252,7 @@ export function CompressVideoPage() {
           durationSeconds: info.durationSeconds,
           width: info.width,
           height: info.height,
+          framesPerSecond: info.framesPerSecond,
           size: info.size,
           videoCodec: info.videoCodec,
           audioCodec: info.audioCodec,
@@ -353,9 +362,28 @@ export function CompressVideoPage() {
     width: item.width ?? 0,
     height: item.height ?? 0,
   }));
-  const targetValidation = validateTargetSize(targetSizeInput, targetSizeUnit, targetInputs);
-  const bitrateEstimates = targetInputs
-    .map((input) => calculateTargetBitrates(targetBytesPerVideo, input.durationSeconds, input.audioKbps))
+  const baseTargetValidation = validateTargetSize(targetSizeInput, targetSizeUnit, targetInputs);
+  const targetResolutionEstimates = readyItems.map((item, index) => {
+    const bitrate = calculateTargetBitrates(targetBytesPerVideo, targetInputs[index].durationSeconds, targetInputs[index].audioKbps);
+    const resolution = bitrate ? chooseTargetResolution(
+      item.width ?? 0,
+      item.height ?? 0,
+      item.framesPerSecond ?? 30,
+      bitrate.videoKbps,
+      allowAutomaticResolutionReduction,
+    ) : null;
+    return { item, bitrate, resolution };
+  });
+  const automaticResolutionTooSmall = targetResolutionEstimates.some(({ resolution }) =>
+    !resolution || resolution.bitsPerPixelPerFrame < MIN_OPENH264_BITS_PER_PIXEL_PER_FRAME,
+  );
+  const targetValidation = allowAutomaticResolutionReduction
+    ? baseTargetValidation && baseTargetValidation !== "tooSmall"
+      ? baseTargetValidation
+      : automaticResolutionTooSmall ? "tooSmall" : null
+    : baseTargetValidation;
+  const bitrateEstimates = targetResolutionEstimates
+    .map(({ bitrate }) => bitrate)
     .filter((estimate): estimate is NonNullable<typeof estimate> => estimate !== null);
   const averageBitrate = bitrateEstimates.length ? bitrateEstimates.reduce((total, estimate) => ({
     totalKbps: total.totalKbps + estimate.totalKbps / bitrateEstimates.length,
@@ -388,7 +416,6 @@ export function CompressVideoPage() {
   const targetCompressionBlocked = mode === "targetFileSize" && (
     targetValidation !== null
     || outputFormat !== "mp4"
-    || allowAutomaticResolutionReduction
     || (nonReducingTarget && !nonReducingAcknowledged)
   );
 
@@ -409,7 +436,6 @@ export function CompressVideoPage() {
     if (mode === "targetFileSize") {
       if (outputFormat !== "mp4") { setPageError(t("targetWebmNotImplemented")); return; }
       if (targetValidation) { setPageError(t(targetValidationTranslations[targetValidation])); return; }
-      if (allowAutomaticResolutionReduction) { setPageError(t("automaticResolutionNotImplemented")); return; }
       if (nonReducingTarget && !nonReducingAcknowledged) { setPageError(t("targetNotSmallerThanOriginal")); return; }
     }
     const queue = items.filter((item) => item.status === "ready");
@@ -586,6 +612,7 @@ export function CompressVideoPage() {
                     </div>
                   )}
                   {item.result && <div className={`video-result-strip ${item.result.noSizeReduction || item.result.targetExceeded ? "no-reduction" : ""}`}>
+                    {item.result.resolutionReducedAutomatically && <div className="video-resolution-reduced"><CheckCircle2 size={15} /><strong>{t("resolutionReducedAutomatically")}</strong></div>}
                     {item.result.targetExceeded && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("targetExceeded")}</strong><span>{t("targetExceededHint")}</span></div>}
                     {item.result.noSizeReduction && !item.result.pendingConfirmation && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("noSizeReduction")}</strong><span>{t("noSizeReductionHint")}</span></div>}
                     <div className="video-result-metrics">
@@ -603,6 +630,8 @@ export function CompressVideoPage() {
                       {item.result.initialVideoBitrateKbps !== null && <span><small>{t("initialVideoBitrate")}</small><strong>{formatBitrate(item.result.initialVideoBitrateKbps)}</strong></span>}
                       {item.result.correctedVideoBitrateKbps !== null && <span><small>{t("correctedVideoBitrate")}</small><strong>{formatBitrate(item.result.correctedVideoBitrateKbps)}</strong></span>}
                       {item.result.targetSize !== null && <span><small>{t("encodingAttempts")}</small><strong>{item.result.attempts}</strong></span>}
+                      {item.result.targetSize !== null && <span><small>{t("originalResolution")}</small><strong>{item.result.originalWidth} × {item.result.originalHeight}</strong></span>}
+                      {item.result.resolutionReducedAutomatically && <span><small>{t("resolutionReductionReason")}</small><strong>{t("resolutionReductionBitrateReason")}</strong></span>}
                       {item.result.estimateDifference !== null && <span><small>{t("estimateDifference")}</small><strong>{item.result.estimateDifference >= 0 ? "+" : "−"}{formatBytes(Math.abs(item.result.estimateDifference))}</strong></span>}
                     </div>
                     <div className="video-result-location"><FolderOpen size={13} /><span title={item.result.outputPath}>{item.result.outputPath}</span></div>
@@ -654,6 +683,11 @@ export function CompressVideoPage() {
               <span><small>{t("estimatedVideoBitrate")}</small><strong>{displayedBitrate ? formatBitrate(displayedBitrate.videoKbps) : "—"}</strong></span>
               <span><small>{t("estimatedAudioBitrate")}</small><strong>{displayedBitrate ? formatBitrate(displayedBitrate.audioKbps) : "—"}</strong></span>
             </div>
+            {!!readyItems.length && <div className="video-target-resolution-preview">
+              {targetResolutionEstimates.map(({ item, resolution }) => <div key={item.path}><span title={item.name}>{item.name}</span><small>{t("originalResolution")}: {item.width} × {item.height}</small><strong>{t("automaticSelectedResolution")}: {resolution ? `${resolution.width} × ${resolution.height}` : "—"}</strong></div>)}
+            </div>}
+            {allowAutomaticResolutionReduction && targetResolutionEstimates.some(({ resolution }) => resolution?.reduced) && <p className="video-resolution-warning"><AlertCircle size={13} />{t("resolutionWillBeReduced")}</p>}
+            {!allowAutomaticResolutionReduction && targetResolutionEstimates.some(({ resolution }) => resolution && resolution.bitsPerPixelPerFrame < MIN_OPENH264_BITS_PER_PIXEL_PER_FRAME) && <p className="video-low-quality-warning"><AlertCircle size={13} />{t("resolutionLowBitrateWarning")}</p>}
             {nonReducingTarget && !nonReducingAcknowledged && <div className="video-target-confirmation"><p>{t("targetNotSmallerThanOriginal")}</p><div><button type="button" onClick={() => { setNonReducingAcknowledgement(null); setMode("recommended"); }}>{t("cancelTargetSize")}</button><button className="continue" type="button" onClick={() => setNonReducingAcknowledgement(acknowledgementKey)}>{t("continueTargetSize")}</button></div></div>}
             {nonReducingTarget && nonReducingAcknowledged && <p className="video-target-acknowledged"><Check size={13} />{t("targetNotSmallerAcknowledged")}</p>}
             <label className="video-auto-resolution"><input type="checkbox" disabled={isProcessing} checked={allowAutomaticResolutionReduction} onChange={(event) => setAllowAutomaticResolutionReduction(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("allowAutomaticResolutionReduction")}</strong><small>{t("allowAutomaticResolutionReductionHint")}</small></span></label>
@@ -689,7 +723,6 @@ export function CompressVideoPage() {
       {activeProgress && <section className="video-progress-panel"><div><span>{t(activeProgress.phase === "encodingAttempt1" ? "encodingAttemptOne" : activeProgress.phase === "adjustingBitrate" ? "adjustingBitrate" : "videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small></section>}
       {pageError && <div className="page-error"><AlertCircle size={16} />{pageError}</div>}
       {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelCompression()}><Ban size={19} />{t("cancelVideoCompression")}</button> : <button className="run-button video-compress-button" type="button" disabled={targetCompressionBlocked || !readyItems.length} title={targetCompressionBlocked ? t("targetSettingsInvalid") : undefined} onClick={() => void runCompression()}><Clapperboard size={19} />{t("compressVideos")}</button>}
-      {mode === "targetFileSize" && allowAutomaticResolutionReduction && <p className="video-disabled-hint">{t("automaticResolutionNotImplemented")}</p>}
 
       {previewResult && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(null); }}><section className="video-preview-modal" role="dialog" aria-modal="true" aria-label={t("previewVideo")}><header><div><strong>{previewResult.outputName}</strong><small>{previewResult.width} × {previewResult.height} · {previewResult.videoCodec} · {formatDuration(previewResult.durationSeconds)}</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(null)} aria-label={t("closePreview")}><X size={17} /></button></header><video src={convertFileSrc(previewResult.outputPath)} controls autoPlay /></section></div>}
     </div>

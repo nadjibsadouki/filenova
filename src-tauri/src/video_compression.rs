@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use crate::video_target_size::{
-    calculate_target_bitrates, corrected_video_bitrate_kbps, minimum_usable_video_bitrate_kbps,
+    calculate_target_bitrates, choose_target_resolution, corrected_video_bitrate_kbps,
+    minimum_usable_video_bitrate_kbps, MIN_OPENH264_BITS_PER_PIXEL_PER_FRAME,
     TARGET_SIZE_SAFETY_MARGIN,
 };
 use crate::video_tools::{
@@ -100,6 +101,10 @@ pub struct VideoCompressionResult {
     attempts: u8,
     target_exceeded: bool,
     pending_confirmation: bool,
+    original_width: u64,
+    original_height: u64,
+    resolution_reduced_automatically: bool,
+    resolution_reduction_reason: Option<String>,
     #[serde(skip_serializing)]
     pending_final_base: Option<String>,
 }
@@ -557,6 +562,10 @@ where
         attempts: 1,
         target_exceeded: false,
         pending_confirmation: false,
+        original_width: input.width,
+        original_height: input.height,
+        resolution_reduced_automatically: false,
+        resolution_reduction_reason: None,
         pending_final_base: None,
     })
 }
@@ -630,15 +639,6 @@ where
             "Target File Size currently supports MP4 only.",
         ));
     }
-    if request
-        .allow_automatic_resolution_reduction
-        .unwrap_or(false)
-    {
-        return Err(VideoCompressionError::new(
-            "automatic_resolution_not_implemented",
-            "Automatic resolution reduction is not implemented yet.",
-        ));
-    }
     let target_size = request
         .target_size_bytes
         .filter(|size| *size > 0)
@@ -671,7 +671,33 @@ where
             "The target bitrate could not be calculated.",
         )
     })?;
-    let minimum = minimum_usable_video_bitrate_kbps(input.width, input.height);
+    let automatic_reduction = request
+        .allow_automatic_resolution_reduction
+        .unwrap_or(false);
+    let resolution = choose_target_resolution(
+        input.width,
+        input.height,
+        input.frames_per_second,
+        initial.video_kbps,
+        automatic_reduction,
+    )
+    .ok_or_else(|| {
+        VideoCompressionError::new(
+            "invalid_video",
+            "The output resolution could not be calculated.",
+        )
+    })?;
+    let resolution_filter = (resolution.width != input.width || resolution.height != input.height)
+        .then_some((resolution.width, resolution.height));
+    let minimum = if automatic_reduction {
+        MIN_OPENH264_BITS_PER_PIXEL_PER_FRAME
+            * resolution.width as f64
+            * resolution.height as f64
+            * input.frames_per_second
+            / 1000.0
+    } else {
+        minimum_usable_video_bitrate_kbps(input.width, input.height)
+    };
     if initial.video_kbps < minimum {
         return Err(VideoCompressionError::new(
             "target_bitrate_too_low",
@@ -703,8 +729,13 @@ where
         phase: "encodingAttempt1".into(),
         attempt: 1,
     });
-    let first_args =
-        target_mp4_ffmpeg_args(&request, &input_path, &first_temporary, initial.video_kbps);
+    let first_args = target_mp4_ffmpeg_args(
+        &request,
+        &input_path,
+        &first_temporary,
+        initial.video_kbps,
+        resolution_filter,
+    );
     run_target_attempt(
         ffmpeg,
         library_dir,
@@ -755,7 +786,13 @@ where
             phase: "adjustingBitrate".into(),
             attempt: 2,
         });
-        let second_args = target_mp4_ffmpeg_args(&request, &input_path, &temporary, corrected);
+        let second_args = target_mp4_ffmpeg_args(
+            &request,
+            &input_path,
+            &temporary,
+            corrected,
+            resolution_filter,
+        );
         run_target_attempt(
             ffmpeg,
             library_dir,
@@ -845,6 +882,12 @@ where
         attempts,
         target_exceeded,
         pending_confirmation,
+        original_width: input.width,
+        original_height: input.height,
+        resolution_reduced_automatically: resolution.reduced,
+        resolution_reduction_reason: resolution
+            .reduced
+            .then(|| "bitrate_quality_threshold".to_owned()),
         pending_final_base: pending_confirmation.then_some(base_name),
     })
 }
@@ -854,6 +897,7 @@ fn target_mp4_ffmpeg_args(
     input: &Path,
     output: &Path,
     video_kbps: f64,
+    resolution: Option<(u64, u64)>,
 ) -> Vec<OsString> {
     let bitrate = format!("{}k", video_kbps.floor().max(1.0) as u64);
     let mut args = vec![
@@ -880,6 +924,15 @@ fn target_mp4_ffmpeg_args(
             "-1".into(),
             "-map_chapters".into(),
             "-1".into(),
+        ]);
+    }
+    if let Some((width, height)) = resolution {
+        args.extend([
+            "-vf".into(),
+            format!(
+                "scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            )
+            .into(),
         ]);
     }
     args.extend([
@@ -1397,6 +1450,40 @@ mod tests {
         );
     }
 
+    fn create_resolution_source(path: &Path, width: u64, height: u64) {
+        let source = format!("testsrc2=size={width}x{height}:rate=30");
+        let output = Command::new(bundled_tool("ffmpeg"))
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=700:sample_rate=44100",
+                "-t",
+                "2",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(path)
+            .env("PATH", path_with_runtime_libraries(&library_dir()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn create_silent_source(path: &Path) {
         let output = Command::new(bundled_tool("ffmpeg"))
             .args([
@@ -1473,6 +1560,7 @@ mod tests {
             Path::new("C:\\input.mp4"),
             Path::new("C:\\output.mp4"),
             640.9,
+            None,
         )
         .iter()
         .map(|value| value.to_string_lossy())
@@ -1487,6 +1575,86 @@ mod tests {
         assert!(!joined.contains("preset"));
         assert!(!joined.contains(" -r "));
         assert!(!joined.contains("scale="));
+
+        let scaled = target_mp4_ffmpeg_args(
+            &request,
+            Path::new("C:\\input.mp4"),
+            Path::new("C:\\scaled.mp4"),
+            640.9,
+            Some((1280, 720)),
+        )
+        .iter()
+        .map(|value| value.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+        assert!(scaled.contains(
+            "-vf scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2"
+        ));
+        assert!(!scaled.contains(" -r "));
+    }
+
+    #[test]
+    fn target_mp4_automatic_resolution_reduction_encodes_landscape_and_portrait_without_upscaling()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let state = VideoCompressionState::default();
+        let target = 230 * 1024;
+
+        for (name, width, height, expected) in [
+            ("landscape", 1280, 720, (640, 360)),
+            ("portrait", 720, 1280, (360, 640)),
+        ] {
+            let source = temp.path().join(format!("{name}.mp4"));
+            create_resolution_source(&source, width, height);
+            let original = fs::read(&source).unwrap();
+
+            let unchanged = compress_with_tools(
+                target_size_request(&source, &output_dir, target),
+                &bundled_tool("ffmpeg"),
+                &bundled_tool("ffprobe"),
+                &library_dir(),
+                &state,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!((unchanged.width, unchanged.height), (width, height));
+            assert!(!unchanged.resolution_reduced_automatically);
+
+            let mut automatic_request = target_size_request(&source, &output_dir, target);
+            automatic_request.allow_automatic_resolution_reduction = Some(true);
+            let reduced = compress_with_tools(
+                automatic_request,
+                &bundled_tool("ffmpeg"),
+                &bundled_tool("ffprobe"),
+                &library_dir(),
+                &state,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!((reduced.width, reduced.height), expected);
+            assert_eq!(
+                (reduced.original_width, reduced.original_height),
+                (width, height)
+            );
+            assert!(reduced.resolution_reduced_automatically);
+            assert_eq!(
+                reduced.resolution_reduction_reason.as_deref(),
+                Some("bitrate_quality_threshold")
+            );
+            assert_eq!(fs::read(&source).unwrap(), original);
+            eprintln!(
+                "{name}: target={target} bytes, disabled={}x{} / {} bytes, enabled={}x{} / {} bytes, attempts={}",
+                unchanged.width,
+                unchanged.height,
+                unchanged.compressed_size,
+                reduced.width,
+                reduced.height,
+                reduced.compressed_size,
+                reduced.attempts
+            );
+        }
     }
 
     #[test]
@@ -1643,7 +1811,13 @@ mod tests {
                     worker_source.parent().unwrap(),
                     700 * 1024,
                 );
-                let args = target_mp4_ffmpeg_args(&request, &worker_source, &worker_output, 500.0);
+                let args = target_mp4_ffmpeg_args(
+                    &request,
+                    &worker_source,
+                    &worker_output,
+                    600.0,
+                    Some((640, 360)),
+                );
                 let mut cleanup = TemporaryOutputs::new();
                 cleanup.track(worker_output);
                 run_target_attempt(
@@ -1690,21 +1864,26 @@ mod tests {
         let output_dir = temp.path().join("outputs");
         fs::create_dir(&output_dir).unwrap();
         let source = temp.path().join("corrective.mp4");
-        create_source(&source, "mp4");
+        create_resolution_source(&source, 1280, 720);
         let original = fs::read(&source).unwrap();
         let state = VideoCompressionState::default();
-        let target = 96 * 1024;
+        let target = 230 * 1024;
+        let mut corrective_request = target_size_request(&source, &output_dir, target);
+        corrective_request.allow_automatic_resolution_reduction = Some(true);
 
         let corrected = compress_target_mp4_with_measure(
-            target_size_request(&source, &output_dir, target),
+            corrective_request.clone(),
             &bundled_tool("ffmpeg"),
             &bundled_tool("ffprobe"),
             &library_dir(),
             &state,
             |_| {},
             |attempt, path| {
-                let actual = fs::metadata(path).unwrap().len();
-                Ok(if attempt == 1 { actual * 2 } else { actual })
+                Ok(if attempt == 1 {
+                    target * 110 / 100
+                } else {
+                    fs::metadata(path).unwrap().len()
+                })
             },
         )
         .unwrap();
@@ -1712,24 +1891,30 @@ mod tests {
         assert!(corrected.corrected_video_bitrate_kbps.is_some());
         assert!(!corrected.pending_confirmation);
         assert!(!corrected.target_exceeded);
+        assert_eq!((corrected.width, corrected.height), (640, 360));
+        assert!(corrected.resolution_reduced_automatically);
         assert!(Path::new(&corrected.output_path).is_file());
 
         let persistent = compress_target_mp4_with_measure(
-            target_size_request(&source, &output_dir, target),
+            corrective_request,
             &bundled_tool("ffmpeg"),
             &bundled_tool("ffprobe"),
             &library_dir(),
             &state,
             |_| {},
-            |attempt, path| {
-                let actual = fs::metadata(path).unwrap().len();
-                Ok(if attempt == 1 { actual * 2 } else { actual * 4 })
+            |attempt, _path| {
+                Ok(if attempt == 1 {
+                    target * 110 / 100
+                } else {
+                    target * 120 / 100
+                })
             },
         )
         .unwrap();
         assert_eq!(persistent.attempts, 2);
         assert!(persistent.target_exceeded);
         assert!(persistent.pending_confirmation);
+        assert_eq!((persistent.width, persistent.height), (640, 360));
         assert!(Path::new(&persistent.output_path).is_file());
         assert!(Path::new(&persistent.output_path)
             .file_name()
