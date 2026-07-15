@@ -3,30 +3,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoConversionPlanRequest {
-    input_video_codec: String,
-    input_audio_codec: Option<String>,
-    output_format: String,
-    video_codec: String,
-    audio_codec: String,
-    preserve_resolution: bool,
-    preserve_frame_rate: bool,
+    pub(crate) input_video_codec: String,
+    pub(crate) input_audio_codec: Option<String>,
+    pub(crate) output_format: String,
+    pub(crate) video_codec: String,
+    pub(crate) audio_codec: String,
+    pub(crate) preserve_resolution: bool,
+    pub(crate) preserve_frame_rate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoConversionPlan {
-    valid: bool,
-    reason: Option<String>,
-    planned_video_codec: String,
-    planned_audio_codec: Option<String>,
-    remux_without_reencoding: bool,
+    pub(crate) valid: bool,
+    pub(crate) reason: Option<String>,
+    pub(crate) planned_video_codec: String,
+    pub(crate) planned_audio_codec: Option<String>,
+    pub(crate) remux_without_reencoding: bool,
 }
 
-fn normalized(value: &str) -> String {
+pub(crate) fn normalized(value: &str) -> String {
     value.trim().to_ascii_uppercase().replace('-', "")
 }
 
-fn container_supports_video(container: &str, codec: &str) -> bool {
+pub(crate) fn container_supports_video(container: &str, codec: &str) -> bool {
     match container {
         "MP4" => matches!(codec, "H264" | "HEVC" | "AV1" | "MPEG4"),
         "MOV" => matches!(codec, "H264" | "HEVC" | "MPEG4" | "PRORES"),
@@ -36,7 +36,7 @@ fn container_supports_video(container: &str, codec: &str) -> bool {
     }
 }
 
-fn container_supports_audio(container: &str, codec: &str) -> bool {
+pub(crate) fn container_supports_audio(container: &str, codec: &str) -> bool {
     match container {
         "MP4" | "MOV" => matches!(codec, "AAC" | "MP3" | "ALAC" | "OPUS"),
         "WEBM" => matches!(codec, "OPUS" | "VORBIS"),
@@ -52,7 +52,11 @@ pub fn build_video_conversion_plan(request: &VideoConversionPlanRequest) -> Vide
     let requested_video = normalized(&request.video_codec);
     let requested_audio = normalized(&request.audio_codec);
 
+    let can_copy_video = container_supports_video(&container, &input_video)
+        && request.preserve_resolution
+        && request.preserve_frame_rate;
     let planned_video = match requested_video.as_str() {
+        "AUTO" if matches!(container.as_str(), "MP4" | "MOV") && can_copy_video => "Copy",
         "AUTO" if container == "WEBM" => "SVT-AV1",
         "AUTO" => "OpenH264",
         "OPENH264" => "OpenH264",
@@ -62,9 +66,13 @@ pub fn build_video_conversion_plan(request: &VideoConversionPlanRequest) -> Vide
             return invalid_plan("unsupported_video_codec", "", None);
         }
     };
+    let can_copy_audio = input_audio
+        .as_deref()
+        .is_some_and(|codec| container_supports_audio(&container, codec));
     let planned_audio = match requested_audio.as_str() {
         "NOAUDIO" => None,
         "AUTO" if input_audio.is_none() => None,
+        "AUTO" if matches!(container.as_str(), "MP4" | "MOV") && can_copy_audio => Some("Copy"),
         "AUTO" if container == "WEBM" => Some("Opus"),
         "AUTO" => Some("AAC"),
         "AAC" => Some("AAC"),
@@ -173,8 +181,17 @@ mod tests {
     fn resolves_auto_only_to_encoders_present_in_the_bundled_build() {
         let mp4 = build_video_conversion_plan(&request("mp4", "auto", "auto"));
         assert!(mp4.valid);
-        assert_eq!(mp4.planned_video_codec, "OpenH264");
-        assert_eq!(mp4.planned_audio_codec.as_deref(), Some("AAC"));
+        assert_eq!(mp4.planned_video_codec, "Copy (H264)");
+        assert_eq!(mp4.planned_audio_codec.as_deref(), Some("Copy (AAC)"));
+        assert!(mp4.remux_without_reencoding);
+
+        let mut incompatible = request("mp4", "auto", "auto");
+        incompatible.input_video_codec = "VP9".into();
+        incompatible.input_audio_codec = Some("VORBIS".into());
+        let encoded = build_video_conversion_plan(&incompatible);
+        assert_eq!(encoded.planned_video_codec, "OpenH264");
+        assert_eq!(encoded.planned_audio_codec.as_deref(), Some("AAC"));
+        assert!(!encoded.remux_without_reencoding);
 
         let webm = build_video_conversion_plan(&request("webm", "auto", "auto"));
         assert!(webm.valid);
