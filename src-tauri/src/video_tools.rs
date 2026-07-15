@@ -392,11 +392,36 @@ mod tests {
             assert!(!stdout.contains("--enable-gpl"));
             assert!(!stdout.contains("--enable-nonfree"));
         }
+
+        let ffmpeg = bundled_tool("ffmpeg");
+        let encoders = Command::new(&ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .env("PATH", path_with_runtime_libraries(&library_dir))
+            .output()
+            .unwrap();
+        let encoder_list = String::from_utf8_lossy(&encoders.stdout);
+        for encoder in ["libopenh264", "libsvtav1", "aac", "libopus"] {
+            assert!(encoder_list.contains(encoder), "missing encoder {encoder}");
+        }
+
+        let muxers = Command::new(ffmpeg)
+            .args(["-hide_banner", "-muxers"])
+            .env("PATH", path_with_runtime_libraries(&library_dir))
+            .output()
+            .unwrap();
+        let muxer_list = String::from_utf8_lossy(&muxers.stdout);
+        for muxer in ["mp4", "webm", "mov", "matroska"] {
+            assert!(muxer_list.contains(muxer), "missing muxer {muxer}");
+        }
     }
 
     fn create_test_video(path: &Path, format: &str) {
         let library_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ffmpeg");
-        let codec = if format == "mp4" { "mpeg4" } else { "mpeg4" };
+        let codec = if format == "webm" {
+            "libvpx-vp9"
+        } else {
+            "mpeg4"
+        };
         let output = run_tool(
             &bundled_tool("ffmpeg"),
             &library_dir,
@@ -417,7 +442,11 @@ mod tests {
                 OsString::from("-c:v"),
                 OsString::from(codec),
                 OsString::from("-c:a"),
-                OsString::from(if format == "mp4" { "aac" } else { "mp3" }),
+                OsString::from(match format {
+                    "mp4" => "aac",
+                    "webm" => "libopus",
+                    _ => "mp3",
+                }),
                 OsString::from("-shortest"),
                 path.as_os_str().to_owned(),
             ],
@@ -431,11 +460,11 @@ mod tests {
     }
 
     #[test]
-    fn analyzes_real_mp4_and_avi_files_with_ffprobe() {
+    fn analyzes_real_mp4_avi_and_webm_files_with_ffprobe() {
         let temp = tempfile::tempdir().unwrap();
         let library_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ffmpeg");
 
-        for format in ["mp4", "avi"] {
+        for format in ["mp4", "avi", "webm"] {
             let path = temp.path().join(format!("sample.{format}"));
             create_test_video(&path, format);
             let info = inspect_video_with_tools(
@@ -448,9 +477,17 @@ mod tests {
 
             assert_eq!((info.width, info.height), (320, 180));
             assert!((info.frames_per_second - 5.0).abs() < 0.01);
-            assert_eq!(info.format, format.to_ascii_uppercase());
+            let expected_format = if format == "webm" {
+                "WebM".to_owned()
+            } else {
+                format.to_ascii_uppercase()
+            };
+            assert_eq!(info.format, expected_format);
             assert!(info.duration_seconds >= 0.9);
-            assert_eq!(info.video_codec, "MPEG4");
+            assert_eq!(
+                info.video_codec,
+                if format == "webm" { "VP9" } else { "MPEG4" }
+            );
             assert!(info.audio_codec.is_some());
             assert!(info.thumbnail_data.is_some());
         }

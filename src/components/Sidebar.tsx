@@ -1,6 +1,7 @@
 import { LockKeyhole } from "lucide-react";
 import { navigationItems, type PageId } from "../navigation";
 import { Brand } from "./Brand";
+import { useI18n } from "../i18n";
 
 interface SidebarProps {
   activePage: PageId;
@@ -8,11 +9,13 @@ interface SidebarProps {
 }
 
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
+  const { t } = useI18n();
   const workspaceItems = navigationItems.filter((item) => item.group === "workspace");
   const accountItems = navigationItems.filter((item) => item.group === "account");
 
   const renderItem = (item: (typeof navigationItems)[number]) => {
     const Icon = item.icon;
+    const label = item.id === "convert-video" ? t("convertVideoNav") : item.label;
     return (
       <button
         className={`nav-item${activePage === item.id ? " active" : ""}`}
@@ -20,10 +23,10 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
         onClick={() => onNavigate(item.id)}
         type="button"
         aria-current={activePage === item.id ? "page" : undefined}
-        title={item.label}
+        title={label}
       >
         <Icon size={19} strokeWidth={1.8} />
-        <span>{item.label}</span>
+        <span>{label}</span>
       </button>
     );
   };
