@@ -7,6 +7,8 @@ mod pdf_split;
 mod pdf_to_images;
 mod resizing;
 mod video_compression;
+#[allow(dead_code)]
+mod video_target_size;
 mod video_tools;
 
 use compression::{compress_image, inspect_image};
@@ -19,7 +21,7 @@ use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_ou
 use resizing::resize_image;
 use video_compression::{
     cancel_video_compression, compress_recommended_video, delete_video_result,
-    VideoCompressionState,
+    keep_video_target_result, VideoCompressionState,
 };
 use video_tools::inspect_video;
 
@@ -50,7 +52,8 @@ pub fn run() {
             inspect_video,
             compress_recommended_video,
             cancel_video_compression,
-            delete_video_result
+            delete_video_result,
+            keep_video_target_result
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

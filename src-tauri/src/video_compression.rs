@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read},
@@ -16,6 +16,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
+use crate::video_target_size::{
+    calculate_target_bitrates, corrected_video_bitrate_kbps, minimum_usable_video_bitrate_kbps,
+    TARGET_SIZE_SAFETY_MARGIN,
+};
 use crate::video_tools::{
     find_sidecar, inspect_video_with_tools, path_with_runtime_libraries, runtime_library_dir,
 };
@@ -34,6 +38,13 @@ struct VideoCompressionInner {
     child: Mutex<Option<Child>>,
     cancel_requested: AtomicBool,
     completed_results: Mutex<HashSet<PathBuf>>,
+    pending_results: Mutex<HashMap<PathBuf, PendingVideoResult>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingVideoResult {
+    destination: PathBuf,
+    base_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +59,8 @@ pub struct VideoCompressionRequest {
     output_format: String,
     quality: Option<u8>,
     estimated_size: Option<u64>,
+    target_size_bytes: Option<u64>,
+    allow_automatic_resolution_reduction: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +71,8 @@ pub struct VideoCompressionProgress {
     processed_seconds: f64,
     duration_seconds: f64,
     percent: f64,
+    phase: String,
+    attempt: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,6 +94,21 @@ pub struct VideoCompressionResult {
     encoding_setting: String,
     estimated_size: Option<u64>,
     estimate_difference: Option<i64>,
+    target_size: Option<u64>,
+    initial_video_bitrate_kbps: Option<f64>,
+    corrected_video_bitrate_kbps: Option<f64>,
+    attempts: u8,
+    target_exceeded: bool,
+    pending_confirmation: bool,
+    #[serde(skip_serializing)]
+    pending_final_base: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptVideoResult {
+    output_path: String,
+    output_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,14 +166,90 @@ pub async fn compress_recommended_video(
     app.asset_protocol_scope()
         .allow_file(&output_path)
         .map_err(|error| VideoCompressionError::new("output_invalid", error.to_string()))?;
+    if result.pending_confirmation {
+        let base_name = result.pending_final_base.clone().ok_or_else(|| {
+            VideoCompressionError::new("output_invalid", "Pending result metadata is missing.")
+        })?;
+        let destination = output_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+            VideoCompressionError::new("output_invalid", "Pending result destination is missing.")
+        })?;
+        state
+            .inner
+            .pending_results
+            .lock()
+            .map_err(|_| {
+                VideoCompressionError::new("encoding_failed", "Pending result lock is poisoned.")
+            })?
+            .insert(
+                output_path,
+                PendingVideoResult {
+                    destination,
+                    base_name,
+                },
+            );
+    } else {
+        state
+            .inner
+            .completed_results
+            .lock()
+            .map_err(|_| VideoCompressionError::new("encoding_failed", "Result lock is poisoned."))?
+            .insert(output_path);
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn keep_video_target_result(
+    app: AppHandle,
+    state: State<'_, VideoCompressionState>,
+    path: String,
+) -> Result<KeptVideoResult, VideoCompressionError> {
+    let temporary = PathBuf::from(path);
+    let pending = state
+        .inner
+        .pending_results
+        .lock()
+        .map_err(|_| {
+            VideoCompressionError::new("encoding_failed", "Pending result lock is poisoned.")
+        })?
+        .get(&temporary)
+        .cloned()
+        .ok_or_else(|| {
+            VideoCompressionError::new(
+                "output_invalid",
+                "This result is not awaiting confirmation.",
+            )
+        })?;
+    let final_output = unique_output_path(&pending.destination, &pending.base_name, "mp4");
+    fs::rename(&temporary, &final_output).map_err(|error| {
+        VideoCompressionError::new("destination_inaccessible", error.to_string())
+    })?;
+    state
+        .inner
+        .pending_results
+        .lock()
+        .map_err(|_| {
+            VideoCompressionError::new("encoding_failed", "Pending result lock is poisoned.")
+        })?
+        .remove(&temporary);
+    app.asset_protocol_scope()
+        .allow_file(&final_output)
+        .map_err(|error| VideoCompressionError::new("output_invalid", error.to_string()))?;
     state
         .inner
         .completed_results
         .lock()
         .map_err(|_| VideoCompressionError::new("encoding_failed", "Result lock is poisoned."))?
-        .insert(output_path);
-
-    Ok(result)
+        .insert(final_output.clone());
+    Ok(KeptVideoResult {
+        output_name: final_output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("video-target.mp4")
+            .to_owned(),
+        output_path: final_output.to_string_lossy().into_owned(),
+    })
 }
 
 #[tauri::command]
@@ -170,6 +276,19 @@ pub fn delete_video_result(
     path: String,
 ) -> Result<(), VideoCompressionError> {
     let path = PathBuf::from(path);
+    if state
+        .inner
+        .pending_results
+        .lock()
+        .map_err(|_| {
+            VideoCompressionError::new("delete_failed", "Pending result lock is poisoned.")
+        })?
+        .remove(&path)
+        .is_some()
+    {
+        return fs::remove_file(&path)
+            .map_err(|error| VideoCompressionError::new("delete_failed", error.to_string()));
+    }
     let mut results = state
         .inner
         .completed_results
@@ -198,6 +317,16 @@ fn compress_with_tools<F>(
 where
     F: FnMut(VideoCompressionProgress),
 {
+    if request.mode == "targetFileSize" {
+        return compress_target_mp4_with_tools(
+            request,
+            ffmpeg,
+            ffprobe,
+            library_dir,
+            state,
+            report,
+        );
+    }
     if request.mode != "recommended" && request.mode != "targetQuality" {
         return Err(VideoCompressionError::new(
             "mode_not_implemented",
@@ -311,6 +440,8 @@ where
                     processed_seconds: processed,
                     duration_seconds: input.duration_seconds,
                     percent,
+                    phase: "encoding".into(),
+                    attempt: 1,
                 });
             }
         }
@@ -395,6 +526,8 @@ where
         processed_seconds: input.duration_seconds,
         duration_seconds: input.duration_seconds,
         percent: 100.0,
+        phase: "encoding".into(),
+        attempt: 1,
     });
 
     Ok(VideoCompressionResult {
@@ -418,7 +551,500 @@ where
         encoding_setting,
         estimated_size: request.estimated_size,
         estimate_difference,
+        target_size: None,
+        initial_video_bitrate_kbps: None,
+        corrected_video_bitrate_kbps: None,
+        attempts: 1,
+        target_exceeded: false,
+        pending_confirmation: false,
+        pending_final_base: None,
     })
+}
+
+struct TemporaryOutputs(Vec<PathBuf>);
+
+impl TemporaryOutputs {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn track(&mut self, path: PathBuf) {
+        self.0.push(path);
+    }
+
+    fn keep(&mut self, path: &Path) {
+        self.0.retain(|candidate| candidate != path);
+    }
+}
+
+impl Drop for TemporaryOutputs {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn compress_target_mp4_with_tools<F>(
+    request: VideoCompressionRequest,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    library_dir: &Path,
+    state: &VideoCompressionState,
+    report: F,
+) -> Result<VideoCompressionResult, VideoCompressionError>
+where
+    F: FnMut(VideoCompressionProgress),
+{
+    compress_target_mp4_with_measure(
+        request,
+        ffmpeg,
+        ffprobe,
+        library_dir,
+        state,
+        report,
+        |_, path| {
+            fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .map_err(|error| VideoCompressionError::new("output_invalid", error.to_string()))
+        },
+    )
+}
+
+fn compress_target_mp4_with_measure<F, M>(
+    request: VideoCompressionRequest,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    library_dir: &Path,
+    state: &VideoCompressionState,
+    mut report: F,
+    mut measure: M,
+) -> Result<VideoCompressionResult, VideoCompressionError>
+where
+    F: FnMut(VideoCompressionProgress),
+    M: FnMut(u8, &Path) -> Result<u64, VideoCompressionError>,
+{
+    if request.output_format != "mp4" {
+        return Err(VideoCompressionError::new(
+            "target_webm_not_implemented",
+            "Target File Size currently supports MP4 only.",
+        ));
+    }
+    if request
+        .allow_automatic_resolution_reduction
+        .unwrap_or(false)
+    {
+        return Err(VideoCompressionError::new(
+            "automatic_resolution_not_implemented",
+            "Automatic resolution reduction is not implemented yet.",
+        ));
+    }
+    let target_size = request
+        .target_size_bytes
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            VideoCompressionError::new("invalid_target_size", "A positive target size is required.")
+        })?;
+    let input_path = PathBuf::from(&request.path);
+    let input = inspect_video_with_tools(&input_path, ffprobe, ffmpeg, library_dir)
+        .map_err(|error| VideoCompressionError::new(error.code, error.message))?;
+    if input.duration_seconds <= 0.0 {
+        return Err(VideoCompressionError::new(
+            "invalid_video",
+            "The video duration is invalid.",
+        ));
+    }
+    let audio_kbps = if request.remove_audio || input.audio_codec.is_none() {
+        0.0
+    } else {
+        160.0
+    };
+    let initial = calculate_target_bitrates(
+        target_size as f64,
+        input.duration_seconds,
+        audio_kbps,
+        TARGET_SIZE_SAFETY_MARGIN,
+    )
+    .ok_or_else(|| {
+        VideoCompressionError::new(
+            "invalid_target_size",
+            "The target bitrate could not be calculated.",
+        )
+    })?;
+    let minimum = minimum_usable_video_bitrate_kbps(input.width, input.height);
+    if initial.video_kbps < minimum {
+        return Err(VideoCompressionError::new(
+            "target_bitrate_too_low",
+            format!("The calculated video bitrate ({:.0} kbps) is below the usable minimum ({minimum:.0} kbps).", initial.video_kbps),
+        ));
+    }
+
+    let destination = destination_directory(&input_path, request.destination_dir.as_deref())?;
+    let stem = input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("video");
+    let target_label = target_size_label(target_size);
+    let base_name = format!("{stem}-target-{target_label}");
+    let mut cleanup = TemporaryOutputs::new();
+    let first_temporary =
+        temporary_output_path(&destination, &format!("{base_name}-attempt-1"), "mp4");
+    verify_destination_writable(&first_temporary)?;
+    cleanup.track(first_temporary.clone());
+    state.inner.cancel_requested.store(false, Ordering::SeqCst);
+
+    report(VideoCompressionProgress {
+        path: request.path.clone(),
+        name: input.name.clone(),
+        processed_seconds: 0.0,
+        duration_seconds: input.duration_seconds,
+        percent: 0.0,
+        phase: "encodingAttempt1".into(),
+        attempt: 1,
+    });
+    let first_args =
+        target_mp4_ffmpeg_args(&request, &input_path, &first_temporary, initial.video_kbps);
+    run_target_attempt(
+        ffmpeg,
+        library_dir,
+        state,
+        &first_args,
+        &request.path,
+        &input.name,
+        input.duration_seconds,
+        "encodingAttempt1",
+        1,
+        &mut report,
+    )?;
+    let mut temporary = first_temporary;
+    let mut verified = validate_target_output(&temporary, ffprobe, ffmpeg, library_dir)?;
+    let mut actual_size = measure(1, &temporary)?;
+    let mut corrected_bitrate = None;
+    let mut attempts = 1;
+
+    if target_exceeded_by_five_percent(actual_size, target_size) {
+        let corrected = corrected_video_bitrate_kbps(initial.video_kbps, target_size, actual_size)
+            .ok_or_else(|| {
+                VideoCompressionError::new(
+                    "invalid_target_size",
+                    "The corrected bitrate could not be calculated.",
+                )
+            })?;
+        if corrected < minimum {
+            return Err(VideoCompressionError::new(
+                "target_bitrate_too_low",
+                format!("The corrected video bitrate ({corrected:.0} kbps) is below the usable minimum ({minimum:.0} kbps)."),
+            ));
+        }
+        corrected_bitrate = Some(corrected);
+        attempts = 2;
+        fs::remove_file(&temporary)
+            .map_err(|error| VideoCompressionError::new("output_invalid", error.to_string()))?;
+        let second_temporary =
+            temporary_output_path(&destination, &format!("{base_name}-attempt-2"), "mp4");
+        verify_destination_writable(&second_temporary)?;
+        cleanup.track(second_temporary.clone());
+        temporary = second_temporary;
+        report(VideoCompressionProgress {
+            path: request.path.clone(),
+            name: input.name.clone(),
+            processed_seconds: 0.0,
+            duration_seconds: input.duration_seconds,
+            percent: 0.0,
+            phase: "adjustingBitrate".into(),
+            attempt: 2,
+        });
+        let second_args = target_mp4_ffmpeg_args(&request, &input_path, &temporary, corrected);
+        run_target_attempt(
+            ffmpeg,
+            library_dir,
+            state,
+            &second_args,
+            &request.path,
+            &input.name,
+            input.duration_seconds,
+            "adjustingBitrate",
+            2,
+            &mut report,
+        )?;
+        verified = validate_target_output(&temporary, ffprobe, ffmpeg, library_dir)?;
+        actual_size = measure(2, &temporary)?;
+    }
+
+    let target_exceeded = target_exceeded_by_five_percent(actual_size, target_size);
+    let pending_confirmation = target_exceeded && attempts == 2;
+    let final_output = if pending_confirmation {
+        cleanup.keep(&temporary);
+        temporary.clone()
+    } else {
+        let output = unique_output_path(&destination, &base_name, "mp4");
+        fs::rename(&temporary, &output).map_err(|error| {
+            VideoCompressionError::new("destination_inaccessible", error.to_string())
+        })?;
+        cleanup.keep(&temporary);
+        output
+    };
+    let saved_bytes = input.size.saturating_sub(actual_size);
+    let no_size_reduction = actual_size >= input.size;
+    let reduction_percent = if no_size_reduction || input.size == 0 {
+        0.0
+    } else {
+        saved_bytes as f64 / input.size as f64 * 100.0
+    };
+    report(VideoCompressionProgress {
+        path: request.path,
+        name: input.name,
+        processed_seconds: input.duration_seconds,
+        duration_seconds: input.duration_seconds,
+        percent: 100.0,
+        phase: if attempts == 2 {
+            "adjustingBitrate".into()
+        } else {
+            "encodingAttempt1".into()
+        },
+        attempt: attempts,
+    });
+
+    Ok(VideoCompressionResult {
+        original_size: input.size,
+        compressed_size: actual_size,
+        saved_bytes,
+        reduction_percent,
+        duration_seconds: verified.duration_seconds,
+        width: verified.width,
+        height: verified.height,
+        video_codec: verified.video_codec,
+        audio_codec: verified.audio_codec,
+        output_path: final_output.to_string_lossy().into_owned(),
+        output_name: if pending_confirmation {
+            format!("{base_name}.mp4")
+        } else {
+            final_output
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("video-target.mp4")
+                .to_owned()
+        },
+        no_size_reduction,
+        quality: None,
+        encoding_setting: format!(
+            "OpenH264 bitrate mode · {:.0} kbps{}",
+            corrected_bitrate.unwrap_or(initial.video_kbps),
+            if corrected_bitrate.is_some() {
+                " corrected"
+            } else {
+                ""
+            }
+        ),
+        estimated_size: Some(target_size),
+        estimate_difference: Some(actual_size as i64 - target_size as i64),
+        target_size: Some(target_size),
+        initial_video_bitrate_kbps: Some(initial.video_kbps),
+        corrected_video_bitrate_kbps: corrected_bitrate,
+        attempts,
+        target_exceeded,
+        pending_confirmation,
+        pending_final_base: pending_confirmation.then_some(base_name),
+    })
+}
+
+fn target_mp4_ffmpeg_args(
+    request: &VideoCompressionRequest,
+    input: &Path,
+    output: &Path,
+    video_kbps: f64,
+) -> Vec<OsString> {
+    let bitrate = format!("{}k", video_kbps.floor().max(1.0) as u64);
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-v".into(),
+        "warning".into(),
+        "-n".into(),
+        "-i".into(),
+        input.as_os_str().to_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+    ];
+    if request.remove_audio {
+        args.push("-an".into());
+    } else {
+        args.extend(["-map".into(), "0:a:0?".into()]);
+    }
+    if request.preserve_metadata {
+        args.extend(["-map_metadata".into(), "0".into()]);
+    } else {
+        args.extend([
+            "-map_metadata".into(),
+            "-1".into(),
+            "-map_chapters".into(),
+            "-1".into(),
+        ]);
+    }
+    args.extend([
+        "-c:v".into(),
+        "libopenh264".into(),
+        "-rc_mode".into(),
+        "bitrate".into(),
+        "-b:v".into(),
+        bitrate.clone().into(),
+        "-maxrate".into(),
+        bitrate.into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-profile:v".into(),
+        "main".into(),
+    ]);
+    if !request.remove_audio {
+        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
+    }
+    args.extend([
+        "-movflags".into(),
+        "+faststart".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-nostats".into(),
+        output.as_os_str().to_owned(),
+    ]);
+    args
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_target_attempt<F>(
+    ffmpeg: &Path,
+    library_dir: &Path,
+    state: &VideoCompressionState,
+    args: &[OsString],
+    input_path: &str,
+    input_name: &str,
+    duration_seconds: f64,
+    phase: &str,
+    attempt: u8,
+    report: &mut F,
+) -> Result<(), VideoCompressionError>
+where
+    F: FnMut(VideoCompressionProgress),
+{
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(args)
+        .env("PATH", path_with_runtime_libraries(library_dir))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| VideoCompressionError::new("ffmpeg_unavailable", error.to_string()))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        VideoCompressionError::new("encoding_failed", "FFmpeg progress pipe is unavailable.")
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        VideoCompressionError::new("encoding_failed", "FFmpeg error pipe is unavailable.")
+    })?;
+    {
+        let mut active = state.inner.child.lock().map_err(|_| {
+            VideoCompressionError::new("encoding_failed", "Process lock is poisoned.")
+        })?;
+        if active.is_some() {
+            let _ = child.kill();
+            return Err(VideoCompressionError::new(
+                "compression_busy",
+                "Another video compression is already running.",
+            ));
+        }
+        *active = Some(child);
+    }
+    let stderr_reader = thread::spawn(move || {
+        let mut message = String::new();
+        let _ = stderr.read_to_string(&mut message);
+        message
+    });
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if let Some(value) = line.strip_prefix("out_time_us=") {
+            if let Ok(microseconds) = value.parse::<f64>() {
+                let processed = (microseconds / 1_000_000.0).max(0.0);
+                report(VideoCompressionProgress {
+                    path: input_path.to_owned(),
+                    name: input_name.to_owned(),
+                    processed_seconds: processed,
+                    duration_seconds,
+                    percent: (processed / duration_seconds * 100.0).clamp(0.0, 99.9),
+                    phase: phase.to_owned(),
+                    attempt,
+                });
+            }
+        }
+    }
+    let status = state
+        .inner
+        .child
+        .lock()
+        .map_err(|_| VideoCompressionError::new("encoding_failed", "Process lock is poisoned."))?
+        .take()
+        .ok_or_else(|| {
+            VideoCompressionError::new("encoding_failed", "FFmpeg process disappeared.")
+        })?
+        .wait()
+        .map_err(|error| VideoCompressionError::new("encoding_failed", error.to_string()))?;
+    let stderr_message = stderr_reader.join().unwrap_or_default();
+    if state.inner.cancel_requested.swap(false, Ordering::SeqCst) {
+        return Err(VideoCompressionError::new(
+            "compression_cancelled",
+            "Video compression was cancelled.",
+        ));
+    }
+    if !status.success() {
+        return Err(classify_ffmpeg_error(&stderr_message));
+    }
+    Ok(())
+}
+
+fn validate_target_output(
+    path: &Path,
+    ffprobe: &Path,
+    ffmpeg: &Path,
+    library_dir: &Path,
+) -> Result<crate::video_tools::VideoInfo, VideoCompressionError> {
+    let size = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if size == 0 {
+        return Err(VideoCompressionError::new(
+            "output_empty",
+            "FFmpeg created an empty output file.",
+        ));
+    }
+    inspect_video_with_tools(path, ffprobe, ffmpeg, library_dir)
+        .map_err(|error| VideoCompressionError::new("output_invalid", error.message))
+}
+
+fn target_exceeded_by_five_percent(actual: u64, target: u64) -> bool {
+    actual as f64 > target as f64 * 1.05
+}
+
+fn target_size_label(bytes: u64) -> String {
+    let (value, unit) = if bytes >= 1024 * 1024 * 1024 {
+        (bytes as f64 / (1024.0 * 1024.0 * 1024.0), "gb")
+    } else if bytes >= 1024 * 1024 {
+        (bytes as f64 / (1024.0 * 1024.0), "mb")
+    } else {
+        (bytes as f64 / 1024.0, "kb")
+    };
+    let formatted = if (value - value.round()).abs() < 0.001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    };
+    format!("{}{}", formatted.replace('.', "-"), unit)
 }
 
 fn destination_directory(
@@ -809,6 +1435,8 @@ mod tests {
             output_format: output_format.into(),
             quality: None,
             estimated_size: None,
+            target_size_bytes: None,
+            allow_automatic_resolution_reduction: None,
         }
     }
 
@@ -823,6 +1451,298 @@ mod tests {
         request.quality = Some(quality);
         request.estimated_size = Some(42_000);
         request
+    }
+
+    fn target_size_request(
+        path: &Path,
+        destination: &Path,
+        target_size_bytes: u64,
+    ) -> VideoCompressionRequest {
+        let mut request = request(path, destination, "mp4");
+        request.mode = "targetFileSize".into();
+        request.target_size_bytes = Some(target_size_bytes);
+        request.allow_automatic_resolution_reduction = Some(false);
+        request
+    }
+
+    #[test]
+    fn target_mp4_arguments_use_only_supported_openh264_bitrate_options() {
+        let request = target_size_request(Path::new("C:\\input.mp4"), Path::new("C:\\"), 1_000_000);
+        let joined = target_mp4_ffmpeg_args(
+            &request,
+            Path::new("C:\\input.mp4"),
+            Path::new("C:\\output.mp4"),
+            640.9,
+        )
+        .iter()
+        .map(|value| value.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+        assert!(joined.contains("-c:v libopenh264 -rc_mode bitrate -b:v 640k -maxrate 640k"));
+        assert!(joined.contains("-pix_fmt yuv420p -profile:v main"));
+        assert!(joined.contains("-c:a aac -b:a 160k"));
+        assert!(joined.contains("-movflags +faststart"));
+        assert!(!joined.contains("-pass"));
+        assert!(!joined.contains("passlogfile"));
+        assert!(!joined.contains("preset"));
+        assert!(!joined.contains(" -r "));
+        assert!(!joined.contains("scale="));
+    }
+
+    #[test]
+    fn target_helpers_limit_correction_to_a_real_size_excess_and_create_expected_names() {
+        assert!(!target_exceeded_by_five_percent(1_050_000, 1_000_000));
+        assert!(target_exceeded_by_five_percent(1_050_001, 1_000_000));
+        let corrected = corrected_video_bitrate_kbps(1_000.0, 1_000_000, 1_200_000).unwrap();
+        assert!((corrected - 808.333_333).abs() < 0.001);
+        assert!(target_exceeded_by_five_percent(1_100_000, 1_000_000));
+        assert_eq!(target_size_label(25 * 1024 * 1024), "25mb");
+        assert_eq!(target_size_label(1536 * 1024), "1-5mb");
+    }
+
+    #[test]
+    fn target_mp4_really_encodes_audio_silent_unique_valid_outputs_and_preserves_originals() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let source = temp.path().join("video.mp4");
+        create_source(&source, "mp4");
+        let original = fs::read(&source).unwrap();
+        let state = VideoCompressionState::default();
+        let target = 96 * 1024;
+
+        let first = compress_with_tools(
+            target_size_request(&source, &output_dir, target),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        let duplicate = compress_with_tools(
+            target_size_request(&source, &output_dir, target),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        let mut muted_request = target_size_request(&source, &output_dir, target);
+        muted_request.remove_audio = true;
+        let muted = compress_with_tools(
+            muted_request,
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(first.output_name, "video-target-96kb.mp4");
+        assert_eq!(duplicate.output_name, "video-target-96kb-2.mp4");
+        assert_eq!(first.video_codec, "H264");
+        assert_eq!(first.audio_codec.as_deref(), Some("AAC"));
+        assert_eq!(muted.audio_codec, None);
+        assert!(first.compressed_size > 0 && first.attempts <= 2);
+        assert_eq!(first.target_size, Some(target));
+        let verified = inspect_video_with_tools(
+            Path::new(&first.output_path),
+            &bundled_tool("ffprobe"),
+            &bundled_tool("ffmpeg"),
+            &library_dir(),
+        )
+        .unwrap();
+        assert!(verified.duration_seconds > 0.0 && verified.width == 320 && verified.height == 180);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(fs::read_dir(&output_dir).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.contains(".tmp.") && !name.contains("passlog")
+        }));
+        eprintln!(
+            "Target 96 KiB -> {} bytes in {} attempt(s)",
+            first.compressed_size, first.attempts
+        );
+    }
+
+    #[test]
+    fn target_mp4_compares_several_real_targets_and_runs_at_most_one_correction() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let source = temp.path().join("sizes.mp4");
+        create_source(&source, "mp4");
+        let original = fs::read(&source).unwrap();
+        let state = VideoCompressionState::default();
+        let mut measured = Vec::new();
+
+        for (target_kib, remove_audio) in [
+            (15_u64, true),
+            (35, false),
+            (40, false),
+            (48, false),
+            (64, false),
+            (96, false),
+        ] {
+            let mut request = target_size_request(&source, &output_dir, target_kib * 1024);
+            request.remove_audio = remove_audio;
+            let result = compress_with_tools(
+                request,
+                &bundled_tool("ffmpeg"),
+                &bundled_tool("ffprobe"),
+                &library_dir(),
+                &state,
+                |_| {},
+            )
+            .unwrap();
+            assert!((1..=2).contains(&result.attempts));
+            assert_eq!(
+                result.corrected_video_bitrate_kbps.is_some(),
+                result.attempts == 2
+            );
+            assert!(Path::new(&result.output_path).is_file());
+            measured.push((
+                target_kib,
+                result.compressed_size,
+                result.attempts,
+                result.target_exceeded,
+            ));
+            if result.pending_confirmation {
+                fs::remove_file(&result.output_path).unwrap();
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        eprintln!("Real Target File Size comparisons (KiB target, bytes actual, attempts, exceeded): {measured:?}");
+        assert!(measured.iter().any(|entry| entry.2 == 1));
+        assert!(measured.iter().all(|entry| entry.2 <= 2));
+    }
+
+    #[test]
+    fn target_mp4_cancellation_cleans_temporary_output_in_either_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("long-target.mp4");
+        create_long_source(&source);
+        let original = fs::read(&source).unwrap();
+
+        for attempt in [1_u8, 2] {
+            let output = temp.path().join(format!(".attempt-{attempt}.tmp.mp4"));
+            let state = VideoCompressionState::default();
+            let worker_state = state.clone();
+            let worker_source = source.clone();
+            let worker_output = output.clone();
+            let phase = if attempt == 1 {
+                "encodingAttempt1"
+            } else {
+                "adjustingBitrate"
+            };
+            let worker = thread::spawn(move || {
+                let request = target_size_request(
+                    &worker_source,
+                    worker_source.parent().unwrap(),
+                    700 * 1024,
+                );
+                let args = target_mp4_ffmpeg_args(&request, &worker_source, &worker_output, 500.0);
+                let mut cleanup = TemporaryOutputs::new();
+                cleanup.track(worker_output);
+                run_target_attempt(
+                    &bundled_tool("ffmpeg"),
+                    &library_dir(),
+                    &worker_state,
+                    &args,
+                    &request.path,
+                    "long-target.mp4",
+                    8.0,
+                    phase,
+                    attempt,
+                    &mut |_| {},
+                )
+            });
+            let mut killed = false;
+            for _ in 0..500 {
+                if let Ok(mut active) = state.inner.child.lock() {
+                    if let Some(child) = active.as_mut() {
+                        state.inner.cancel_requested.store(true, Ordering::SeqCst);
+                        child.kill().unwrap();
+                        killed = true;
+                        break;
+                    }
+                }
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(killed, "Attempt {attempt} did not become active");
+            let error = worker.join().unwrap().unwrap_err();
+            assert_eq!(error.code, "compression_cancelled");
+            assert!(!output.exists());
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("passlog")));
+    }
+
+    #[test]
+    fn target_mp4_executes_one_full_correction_and_requires_consent_if_excess_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let source = temp.path().join("corrective.mp4");
+        create_source(&source, "mp4");
+        let original = fs::read(&source).unwrap();
+        let state = VideoCompressionState::default();
+        let target = 96 * 1024;
+
+        let corrected = compress_target_mp4_with_measure(
+            target_size_request(&source, &output_dir, target),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+            |attempt, path| {
+                let actual = fs::metadata(path).unwrap().len();
+                Ok(if attempt == 1 { actual * 2 } else { actual })
+            },
+        )
+        .unwrap();
+        assert_eq!(corrected.attempts, 2);
+        assert!(corrected.corrected_video_bitrate_kbps.is_some());
+        assert!(!corrected.pending_confirmation);
+        assert!(!corrected.target_exceeded);
+        assert!(Path::new(&corrected.output_path).is_file());
+
+        let persistent = compress_target_mp4_with_measure(
+            target_size_request(&source, &output_dir, target),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+            |attempt, path| {
+                let actual = fs::metadata(path).unwrap().len();
+                Ok(if attempt == 1 { actual * 2 } else { actual * 4 })
+            },
+        )
+        .unwrap();
+        assert_eq!(persistent.attempts, 2);
+        assert!(persistent.target_exceeded);
+        assert!(persistent.pending_confirmation);
+        assert!(Path::new(&persistent.output_path).is_file());
+        assert!(Path::new(&persistent.output_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("attempt-2"));
+        assert!(fs::read_dir(&output_dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("attempt-1")));
+        fs::remove_file(&persistent.output_path).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), original);
     }
 
     #[test]

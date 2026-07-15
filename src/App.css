@@ -960,7 +960,29 @@ button { color: inherit; }
 .video-target-size > span { display: block; margin-bottom: 6px; color: #61736a; font-size: 7.5px; font-weight: 700; }
 .video-target-size > div { display: flex; overflow: hidden; border: 1px solid #dfe5e2; border-radius: 7px; background: #fff; }
 .video-target-size input { width: 100%; min-width: 0; padding: 8px; border: 0; outline: 0; color: #485b52; }
-.video-target-size b { display: grid; padding: 0 10px; place-items: center; border-inline-start: 1px solid #e2e7e4; color: #87938d; font-size: 8px; }
+.video-target-size select { min-width: 64px; padding: 0 9px; border: 0; border-inline-start: 1px solid #e2e7e4; outline: 0; color: #667970; background: #fff; font-size: 8px; font-weight: 700; }
+.video-target-presets { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-top: 7px; }
+.video-target-presets button { min-height: 25px; padding: 4px; border: 1px solid #dce6e0; border-radius: 7px; color: #52675d; background: #fff; font: inherit; font-size: 6.8px; cursor: pointer; }
+.video-target-presets button:hover, .video-target-presets button.active { border-color: #bd8252; color: #8d552b; background: #fff8f2; }
+.video-target-estimates { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-top: 8px; overflow: hidden; border: 1px solid #e2e9e5; border-radius: 8px; background: #e2e9e5; }
+.video-target-estimates > span { min-width: 0; padding: 8px; background: #fff; }
+.video-target-estimates small, .video-target-estimates strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.video-target-estimates small { color: #87968f; font-size: 6.2px; }
+.video-target-estimates strong { margin-top: 4px; direction: ltr; color: #456657; font-size: 8px; unicode-bidi: isolate; }
+.video-target-validation, .video-low-quality-warning { display: flex; align-items: center; gap: 5px; margin: 7px 2px 0; color: #a44b3d; font-size: 6.8px; line-height: 1.4; }
+.video-target-confirmation { margin-top: 8px; padding: 9px; border: 1px solid #e6c98e; border-radius: 8px; background: #fff9e9; }
+.video-target-confirmation p { margin: 0; color: #815b24; font-size: 7px; font-weight: 700; }
+.video-target-confirmation > div { display: flex; justify-content: flex-end; gap: 6px; margin-top: 7px; }
+.video-target-confirmation button { padding: 5px 9px; border: 1px solid #d9c7a5; border-radius: 6px; color: #785d34; background: #fff; font: inherit; font-size: 6.8px; cursor: pointer; }
+.video-target-confirmation button.continue { border-color: #b47745; color: #fff; background: #a76631; }
+.video-target-acknowledged { display: flex; align-items: center; gap: 5px; margin: 7px 2px 0; color: #547965; font-size: 6.8px; line-height: 1.4; }
+.video-auto-resolution { display: flex; align-items: center; gap: 9px; margin-top: 8px; padding: 9px; border: 1px solid #e3e8e5; border-radius: 8px; background: #fff; cursor: pointer; }
+.video-auto-resolution input { position: absolute; opacity: 0; pointer-events: none; }
+.video-auto-resolution .custom-check { display: grid; width: 18px; height: 18px; flex: none; place-items: center; border: 1px solid #cfd8d4; border-radius: 5px; color: transparent; }
+.video-auto-resolution input:checked + .custom-check { border-color: #648f7d; color: #fff; background: #648f7d; }
+.video-auto-resolution strong, .video-auto-resolution small { display: block; }
+.video-auto-resolution strong { color: #52665c; font-size: 7.7px; }
+.video-auto-resolution small { margin-top: 3px; color: #929e98; font-size: 6.5px; line-height: 1.35; }
 .video-check-options { display: grid; gap: 6px; margin-top: 13px; }
 .video-check-options label { display: flex; align-items: center; gap: 9px; padding: 9px; border: 1px solid #e3e8e5; border-radius: 8px; cursor: pointer; }
 .video-check-options input { position: absolute; opacity: 0; pointer-events: none; }
@@ -1025,7 +1047,7 @@ button { color: inherit; }
 [dir="rtl"] .video-file-title small { text-align: right; }
 [dir="rtl"] .video-thumbnail > span { right: auto; left: 6px; }
 [dir="rtl"] .video-mode-options button { text-align: right; }
-[dir="rtl"] .video-target-size input { direction: ltr; text-align: right; }
+[dir="rtl"] .video-target-size input, [dir="rtl"] .video-target-size select, [dir="rtl"] .video-target-estimates strong { direction: ltr; text-align: right; }
 [dir="rtl"] .technical-path { text-align: right; }
 [dir="rtl"] .video-result-location span, [dir="rtl"] .video-preview-modal header small { text-align: right; }
 [dir="rtl"] .video-progress-panel small { text-align: left; }

@@ -25,6 +25,14 @@ import {
   X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
+import {
+  calculateTargetBitrates,
+  estimatedReductionPercent,
+  targetSizeToBytes,
+  validateTargetSize,
+  type TargetSizeUnit,
+  type TargetSizeValidationCode,
+} from "../utils/videoTargetSize";
 
 type VideoMode = "recommended" | "targetQuality" | "targetFileSize";
 type VideoStatus = "analyzing" | "ready" | "processing" | "completed" | "cancelled" | "failed";
@@ -78,6 +86,12 @@ interface VideoCompressionResult {
   encodingSetting: string;
   estimatedSize: number | null;
   estimateDifference: number | null;
+  targetSize: number | null;
+  initialVideoBitrateKbps: number | null;
+  correctedVideoBitrateKbps: number | null;
+  attempts: number;
+  targetExceeded: boolean;
+  pendingConfirmation: boolean;
 }
 
 interface VideoCompressionProgress {
@@ -86,6 +100,8 @@ interface VideoCompressionProgress {
   processedSeconds: number;
   durationSeconds: number;
   percent: number;
+  phase: "encoding" | "encodingAttempt1" | "adjustingBitrate";
+  attempt: number;
 }
 
 const videoErrorTranslations: Record<string, TranslationKey> = {
@@ -109,6 +125,10 @@ const videoErrorTranslations: Record<string, TranslationKey> = {
   invalid_output_format: "videoInvalidOutputFormat",
   mode_not_implemented: "videoModeNotImplemented",
   delete_failed: "videoDeleteFailed",
+  invalid_target_size: "targetSizeNonNumeric",
+  target_bitrate_too_low: "targetSizeTooSmall",
+  target_webm_not_implemented: "targetWebmNotImplemented",
+  automatic_resolution_not_implemented: "automaticResolutionNotImplemented",
 };
 
 function fileNameFromPath(path: string) {
@@ -150,6 +170,12 @@ function estimateVideoSize(size: number, quality: number, outputFormat: OutputFo
   return Math.max(1, Math.round(size * ratio * formatFactor * (removeAudio ? 0.92 : 1)));
 }
 
+function formatBitrate(kbps: number) {
+  if (!Number.isFinite(kbps) || kbps < 0) return "—";
+  if (kbps === 0) return "0 kbps";
+  return kbps >= 1000 ? `${(kbps / 1000).toFixed(2)} Mbps` : `${Math.round(kbps)} kbps`;
+}
+
 function parseCommandError(error: unknown): { code: string; message?: string } {
   if (typeof error === "object" && error !== null) {
     const value = error as Record<string, unknown>;
@@ -177,7 +203,10 @@ export function CompressVideoPage() {
   const [destination, setDestination] = useState<string | null>(null);
   const [mode, setMode] = useState<VideoMode>("recommended");
   const [quality, setQuality] = useState(70);
-  const [targetSizeMb, setTargetSizeMb] = useState(25);
+  const [targetSizeInput, setTargetSizeInput] = useState("25");
+  const [targetSizeUnit, setTargetSizeUnit] = useState<TargetSizeUnit>("MB");
+  const [allowAutomaticResolutionReduction, setAllowAutomaticResolutionReduction] = useState(false);
+  const [nonReducingAcknowledgement, setNonReducingAcknowledgement] = useState<string | null>(null);
   const [preserveResolution, setPreserveResolution] = useState(true);
   const [removeAudio, setRemoveAudio] = useState(false);
   const [preserveMetadata, setPreserveMetadata] = useState(true);
@@ -282,8 +311,12 @@ export function CompressVideoPage() {
     if (typeof selected === "string") setDestination(selected);
   }
 
-  function removeItem(path: string) {
+  async function removeItem(path: string) {
     if (isProcessing) return;
+    const pending = items.find((item) => item.path === path)?.result;
+    if (pending?.pendingConfirmation) {
+      await invoke("delete_video_result", { path: pending.outputPath }).catch(() => undefined);
+    }
     setItems((current) => {
       const removed = current.find((item) => item.path === path);
       if (removed?.thumbnailUrl) {
@@ -294,8 +327,11 @@ export function CompressVideoPage() {
     });
   }
 
-  function clearAll() {
+  async function clearAll() {
     if (isProcessing) return;
+    await Promise.all(items.filter((item) => item.result?.pendingConfirmation).map((item) =>
+      invoke("delete_video_result", { path: item.result!.outputPath }).catch(() => undefined),
+    ));
     items.forEach((item) => {
       if (item.thumbnailUrl) URL.revokeObjectURL(item.thumbnailUrl);
     });
@@ -305,14 +341,56 @@ export function CompressVideoPage() {
 
   const readyItems = items.filter((item) => item.status === "ready");
   const totalInputSize = readyItems.reduce((total, item) => total + (item.size ?? 0), 0);
+  const parsedTargetSize = Number(targetSizeInput);
+  const targetBytesPerVideo = Number.isFinite(parsedTargetSize) && parsedTargetSize > 0
+    ? targetSizeToBytes(parsedTargetSize, targetSizeUnit)
+    : 0;
+  const targetBatchSize = targetBytesPerVideo * readyItems.length;
+  const outputAudioKbps = removeAudio ? 0 : outputFormat === "mp4" ? 160 : 128;
+  const targetInputs = readyItems.map((item) => ({
+    durationSeconds: item.durationSeconds ?? 0,
+    audioKbps: item.audioCodec ? outputAudioKbps : 0,
+    width: item.width ?? 0,
+    height: item.height ?? 0,
+  }));
+  const targetValidation = validateTargetSize(targetSizeInput, targetSizeUnit, targetInputs);
+  const bitrateEstimates = targetInputs
+    .map((input) => calculateTargetBitrates(targetBytesPerVideo, input.durationSeconds, input.audioKbps))
+    .filter((estimate): estimate is NonNullable<typeof estimate> => estimate !== null);
+  const averageBitrate = bitrateEstimates.length ? bitrateEstimates.reduce((total, estimate) => ({
+    totalKbps: total.totalKbps + estimate.totalKbps / bitrateEstimates.length,
+    videoKbps: total.videoKbps + estimate.videoKbps / bitrateEstimates.length,
+    audioKbps: total.audioKbps + estimate.audioKbps / bitrateEstimates.length,
+    overheadKbps: total.overheadKbps + estimate.overheadKbps / bitrateEstimates.length,
+  }), { totalKbps: 0, videoKbps: 0, audioKbps: 0, overheadKbps: 0 }) : null;
+  const displayedBitrate = targetValidation === null || targetValidation === "tooSmall" ? averageBitrate : null;
+  const estimatedTargetReduction = estimatedReductionPercent(totalInputSize, targetBatchSize);
+  const nonReducingTarget = targetValidation === null && targetBytesPerVideo > 0
+    && readyItems.some((item) => targetBytesPerVideo >= (item.size ?? 0));
+  const acknowledgementKey = `${targetSizeInput}:${targetSizeUnit}:${readyItems.map((item) => `${item.path}:${item.size}`).join("|")}`;
+  const nonReducingAcknowledged = nonReducingAcknowledgement === acknowledgementKey;
   const estimatedOutputSize = useMemo(() => {
     if (!readyItems.length) return 0;
-    if (mode === "targetFileSize") return targetSizeMb * 1024 * 1024 * readyItems.length;
+    if (mode === "targetFileSize") return targetValidation === null ? targetBatchSize : 0;
     if (mode === "targetQuality") {
       return readyItems.reduce((total, item) => total + estimateVideoSize(item.size ?? 0, quality, outputFormat, removeAudio), 0);
     }
     return Math.round(totalInputSize * 0.58 * (removeAudio ? 0.92 : 1));
-  }, [mode, quality, readyItems, removeAudio, outputFormat, targetSizeMb, totalInputSize]);
+  }, [mode, quality, readyItems, removeAudio, outputFormat, targetBatchSize, targetValidation, totalInputSize]);
+
+  const targetValidationTranslations: Record<TargetSizeValidationCode, TranslationKey> = {
+    nonNumeric: "targetSizeNonNumeric",
+    zero: "targetSizeZero",
+    negative: "targetSizeNegative",
+    tooLarge: "targetSizeTooLarge",
+    tooSmall: "targetSizeTooSmall",
+  };
+  const targetCompressionBlocked = mode === "targetFileSize" && (
+    targetValidation !== null
+    || outputFormat !== "mp4"
+    || allowAutomaticResolutionReduction
+    || (nonReducingTarget && !nonReducingAcknowledged)
+  );
 
   const qualityDescription = quality <= 30
     ? t("videoQualitySmaller")
@@ -329,8 +407,10 @@ export function CompressVideoPage() {
 
   async function runCompression() {
     if (mode === "targetFileSize") {
-      setPageError(t("videoModeNotImplemented"));
-      return;
+      if (outputFormat !== "mp4") { setPageError(t("targetWebmNotImplemented")); return; }
+      if (targetValidation) { setPageError(t(targetValidationTranslations[targetValidation])); return; }
+      if (allowAutomaticResolutionReduction) { setPageError(t("automaticResolutionNotImplemented")); return; }
+      if (nonReducingTarget && !nonReducingAcknowledged) { setPageError(t("targetNotSmallerThanOriginal")); return; }
     }
     const queue = items.filter((item) => item.status === "ready");
     if (!queue.length || isProcessing) return;
@@ -344,7 +424,7 @@ export function CompressVideoPage() {
       const item = queue[index];
       if (cancellationRequested.current) break;
       setBatchPosition({ current: index + 1, total: queue.length });
-      setActiveProgress({ path: item.path, name: item.name, processedSeconds: 0, durationSeconds: item.durationSeconds ?? 0, percent: 0 });
+      setActiveProgress({ path: item.path, name: item.name, processedSeconds: 0, durationSeconds: item.durationSeconds ?? 0, percent: 0, phase: mode === "targetFileSize" ? "encodingAttempt1" : "encoding", attempt: 1 });
       setItems((current) => current.map((entry) => entry.path === item.path ? {
         ...entry,
         status: "processing",
@@ -365,7 +445,9 @@ export function CompressVideoPage() {
             preserveMetadata,
             outputFormat,
             quality: mode === "targetQuality" ? quality : null,
-            estimatedSize: mode === "targetQuality" ? estimateVideoSize(item.size ?? 0, quality, outputFormat, removeAudio) : null,
+            estimatedSize: mode === "targetQuality" ? estimateVideoSize(item.size ?? 0, quality, outputFormat, removeAudio) : mode === "targetFileSize" ? targetBytesPerVideo : null,
+            targetSizeBytes: mode === "targetFileSize" ? targetBytesPerVideo : null,
+            allowAutomaticResolutionReduction: mode === "targetFileSize" ? allowAutomaticResolutionReduction : false,
           },
         });
         setItems((current) => current.map((entry) => entry.path === item.path ? {
@@ -415,6 +497,21 @@ export function CompressVideoPage() {
     } catch (error) {
       const parsed = parseCommandError(error);
       setPageError(parsed.message || t(videoErrorTranslations[parsed.code] ?? "videoDeleteFailed"));
+    }
+  }
+
+  async function keepTargetResult(item: VideoItem) {
+    if (!item.result?.pendingConfirmation || isProcessing) return;
+    try {
+      const kept = await invoke<{ outputPath: string; outputName: string }>("keep_video_target_result", { path: item.result.outputPath });
+      setItems((current) => current.map((entry) => entry.path === item.path && entry.result ? {
+        ...entry,
+        resultKept: true,
+        result: { ...entry.result, ...kept, pendingConfirmation: false },
+      } : entry));
+    } catch (error) {
+      const parsed = parseCommandError(error);
+      setPageError(parsed.message || t("videoOutputInvalid"));
     }
   }
 
@@ -488,8 +585,9 @@ export function CompressVideoPage() {
                       <span><small>{t("audioCodec")}</small><strong className="technical-value">{item.audioCodec ?? (item.status === "ready" ? t("noAudio") : "—")}</strong></span>
                     </div>
                   )}
-                  {item.result && <div className={`video-result-strip ${item.result.noSizeReduction ? "no-reduction" : ""}`}>
-                    {item.result.noSizeReduction && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("noSizeReduction")}</strong><span>{t("noSizeReductionHint")}</span></div>}
+                  {item.result && <div className={`video-result-strip ${item.result.noSizeReduction || item.result.targetExceeded ? "no-reduction" : ""}`}>
+                    {item.result.targetExceeded && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("targetExceeded")}</strong><span>{t("targetExceededHint")}</span></div>}
+                    {item.result.noSizeReduction && !item.result.pendingConfirmation && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("noSizeReduction")}</strong><span>{t("noSizeReductionHint")}</span></div>}
                     <div className="video-result-metrics">
                       <span><small>{t("originalSize")}</small><strong>{formatBytes(item.result.originalSize)}</strong></span>
                       <span><small>{t("compressedSize")}</small><strong>{formatBytes(item.result.compressedSize)}</strong></span>
@@ -501,6 +599,10 @@ export function CompressVideoPage() {
                       {item.result.quality !== null && <span><small>{t("selectedQuality")}</small><strong>{item.result.quality}%</strong></span>}
                       <span title={item.result.encodingSetting}><small>{t("encodingSetting")}</small><strong>{item.result.encodingSetting}</strong></span>
                       {item.result.estimatedSize !== null && <span><small>{t("estimatedSizeResult")}</small><strong>{formatBytes(item.result.estimatedSize)}</strong></span>}
+                      {item.result.targetSize !== null && <span><small>{t("targetSizeResult")}</small><strong>{formatBytes(item.result.targetSize)}</strong></span>}
+                      {item.result.initialVideoBitrateKbps !== null && <span><small>{t("initialVideoBitrate")}</small><strong>{formatBitrate(item.result.initialVideoBitrateKbps)}</strong></span>}
+                      {item.result.correctedVideoBitrateKbps !== null && <span><small>{t("correctedVideoBitrate")}</small><strong>{formatBitrate(item.result.correctedVideoBitrateKbps)}</strong></span>}
+                      {item.result.targetSize !== null && <span><small>{t("encodingAttempts")}</small><strong>{item.result.attempts}</strong></span>}
                       {item.result.estimateDifference !== null && <span><small>{t("estimateDifference")}</small><strong>{item.result.estimateDifference >= 0 ? "+" : "−"}{formatBytes(Math.abs(item.result.estimateDifference))}</strong></span>}
                     </div>
                     <div className="video-result-location"><FolderOpen size={13} /><span title={item.result.outputPath}>{item.result.outputPath}</span></div>
@@ -508,13 +610,14 @@ export function CompressVideoPage() {
                       <button className="text-button" type="button" onClick={() => setPreviewResult(item.result!)}><Play size={13} />{t("previewVideo")}</button>
                       <button className="text-button" type="button" onClick={() => void openPath(item.result!.outputPath)}><Video size={13} />{t("openVideo")}</button>
                       <button className="text-button" type="button" onClick={() => void revealItemInDir(item.result!.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button>
-                      {item.result.noSizeReduction && !item.resultKept && <><button className="text-button danger" type="button" onClick={() => void deleteResult(item)}><Trash2 size={13} />{t("deleteResult")}</button><button className="text-button" type="button" onClick={() => setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, resultKept: true } : entry))}><Check size={13} />{t("keepResult")}</button></>}
+                      {item.result.pendingConfirmation && <><button className="text-button danger" type="button" onClick={() => void deleteResult(item)}><Trash2 size={13} />{t("deleteResult")}</button><button className="text-button" type="button" onClick={() => void keepTargetResult(item)}><Check size={13} />{t("keepResult")}</button></>}
+                      {item.result.noSizeReduction && !item.result.pendingConfirmation && !item.resultKept && <><button className="text-button danger" type="button" onClick={() => void deleteResult(item)}><Trash2 size={13} />{t("deleteResult")}</button><button className="text-button" type="button" onClick={() => setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, resultKept: true } : entry))}><Check size={13} />{t("keepResult")}</button></>}
                       {item.resultKept && <span className="video-result-kept"><Check size={13} />{t("resultKept")}</span>}
                     </div>
                   </div>}
                 </div>
 
-                <button className="video-remove-button" type="button" disabled={isProcessing} onClick={() => removeItem(item.path)} title={t("remove")}>
+                <button className="video-remove-button" type="button" disabled={isProcessing} onClick={() => void removeItem(item.path)} title={t("remove")}>
                   <Trash2 size={15} /><span>{t("remove")}</span>
                 </button>
               </article>
@@ -528,7 +631,7 @@ export function CompressVideoPage() {
           <div className="video-section-title"><CircleGauge size={18} /><div><h2>{t("videoCompressionMode")}</h2><p>{t("videoCompressionModeHint")}</p></div></div>
           <div className="video-mode-options">
             {(["recommended", "targetQuality", "targetFileSize"] as VideoMode[]).map((value) => (
-              <button type="button" disabled={isProcessing} className={mode === value ? "active" : ""} key={value} onClick={() => setMode(value)}>
+              <button type="button" disabled={isProcessing} className={mode === value ? "active" : ""} key={value} onClick={() => { setMode(value); if (value === "targetFileSize") { setOutputFormat("mp4"); setPreserveResolution(true); } }}>
                 <span className="radio-dot" /><span><strong>{t(`video${value[0].toUpperCase()}${value.slice(1)}` as TranslationKey)}</strong><small>{t(`video${value[0].toUpperCase()}${value.slice(1)}Hint` as TranslationKey)}</small></span>
               </button>
             ))}
@@ -540,19 +643,35 @@ export function CompressVideoPage() {
             </div>
             <p className="video-quality-warning"><AlertCircle size={13} />{t("videoQualityEstimateWarning")}</p>
           </div>}
-          {mode === "targetFileSize" && <label className="video-target-size"><span>{t("targetFileSizePerVideo")}</span><div><input type="number" min="1" step="1" value={targetSizeMb} onChange={(event) => setTargetSizeMb(Math.max(1, Number(event.target.value) || 1))} /><b>MB</b></div></label>}
+          {mode === "targetFileSize" && <div className="video-target-size-controls">
+            <label className="video-target-size"><span>{t("targetFileSizePerVideo")}</span><div><input type="text" inputMode="decimal" value={targetSizeInput} onChange={(event) => setTargetSizeInput(event.target.value)} aria-invalid={targetValidation !== null} /><select value={targetSizeUnit} onChange={(event) => setTargetSizeUnit(event.target.value as TargetSizeUnit)} aria-label={t("targetSizeUnit")}>{(["KB", "MB", "GB"] as TargetSizeUnit[]).map((unit) => <option value={unit} key={unit}>{unit}</option>)}</select></div></label>
+            {targetValidation && <p className="video-target-validation"><AlertCircle size={13} />{t(targetValidationTranslations[targetValidation])}</p>}
+            <div className="video-target-presets" aria-label={t("targetSizePresets")}>{[5, 10, 25, 50, 100].map((value) => <button type="button" disabled={isProcessing} className={targetSizeUnit === "MB" && parsedTargetSize === value ? "active" : ""} key={value} onClick={() => { setTargetSizeInput(String(value)); setTargetSizeUnit("MB"); }}>{value} MB</button>)}</div>
+            <div className="video-target-estimates">
+              <span><small>{t("originalSize")}</small><strong>{totalInputSize ? formatBytes(totalInputSize) : "—"}</strong></span>
+              <span><small>{t("estimatedReduction")}</small><strong>{targetValidation === null && totalInputSize ? `${estimatedTargetReduction.toFixed(1)}%` : "—"}</strong></span>
+              <span><small>{t("estimatedTotalBitrate")}</small><strong>{displayedBitrate ? formatBitrate(displayedBitrate.totalKbps) : "—"}</strong></span>
+              <span><small>{t("estimatedVideoBitrate")}</small><strong>{displayedBitrate ? formatBitrate(displayedBitrate.videoKbps) : "—"}</strong></span>
+              <span><small>{t("estimatedAudioBitrate")}</small><strong>{displayedBitrate ? formatBitrate(displayedBitrate.audioKbps) : "—"}</strong></span>
+            </div>
+            {nonReducingTarget && !nonReducingAcknowledged && <div className="video-target-confirmation"><p>{t("targetNotSmallerThanOriginal")}</p><div><button type="button" onClick={() => { setNonReducingAcknowledgement(null); setMode("recommended"); }}>{t("cancelTargetSize")}</button><button className="continue" type="button" onClick={() => setNonReducingAcknowledgement(acknowledgementKey)}>{t("continueTargetSize")}</button></div></div>}
+            {nonReducingTarget && nonReducingAcknowledged && <p className="video-target-acknowledged"><Check size={13} />{t("targetNotSmallerAcknowledged")}</p>}
+            <label className="video-auto-resolution"><input type="checkbox" disabled={isProcessing} checked={allowAutomaticResolutionReduction} onChange={(event) => setAllowAutomaticResolutionReduction(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("allowAutomaticResolutionReduction")}</strong><small>{t("allowAutomaticResolutionReductionHint")}</small></span></label>
+            {targetValidation === "tooSmall" && <p className="video-low-quality-warning"><AlertCircle size={13} />{t("targetLowQualityWarning")}</p>}
+            <p className="video-quality-warning"><AlertCircle size={13} />{t("targetSizeVariationWarning")}</p>
+          </div>}
         </section>
 
         <section className="compress-panel video-options-panel">
           <div className="video-section-title"><Settings2 size={18} /><div><h2>{t("videoOptions")}</h2><p>{t("videoOptionsHint")}</p></div></div>
           <div className="video-check-options">
-            <label><input type="checkbox" disabled={isProcessing} checked={preserveResolution} onChange={(event) => setPreserveResolution(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("preserveResolution")}</strong><small>{t("preserveResolutionHint")}</small></span></label>
+            <label><input type="checkbox" disabled={isProcessing || mode === "targetFileSize"} checked={preserveResolution} onChange={(event) => setPreserveResolution(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("preserveResolution")}</strong><small>{t("preserveResolutionHint")}</small></span></label>
             <label><input type="checkbox" disabled={isProcessing} checked={removeAudio} onChange={(event) => setRemoveAudio(event.target.checked)} /><span className="custom-check"><VolumeX size={13} /></span><span><strong>{t("removeAudio")}</strong><small>{t("removeAudioHint")}</small></span></label>
             <label><input type="checkbox" disabled={isProcessing} checked={preserveMetadata} onChange={(event) => setPreserveMetadata(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("preserveMetadata")}</strong><small>{t("preserveMetadataHint")}</small></span></label>
           </div>
           <div className="video-output-format">
             <strong>{t("outputFormat")}</strong>
-            <div>{(["mp4", "webm"] as OutputFormat[]).map((value) => <button type="button" disabled={isProcessing} className={outputFormat === value ? "active" : ""} onClick={() => setOutputFormat(value)} key={value}>{value === "mp4" ? "MP4" : "WebM"}</button>)}</div>
+            <div>{(["mp4", "webm"] as OutputFormat[]).map((value) => <button type="button" disabled={isProcessing || (mode === "targetFileSize" && value === "webm")} className={outputFormat === value ? "active" : ""} onClick={() => setOutputFormat(value)} key={value}>{value === "mp4" ? "MP4" : "WebM"}</button>)}</div>
           </div>
         </section>
       </div>
@@ -567,10 +686,10 @@ export function CompressVideoPage() {
         <div><span>{t("totalInputSize")}</span><strong>{totalInputSize ? formatBytes(totalInputSize) : "—"}</strong><small>{t("videoFilesReady", { count: readyItems.length })}</small></div>
       </section>
 
-      {activeProgress && <section className="video-progress-panel"><div><span>{t("videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small></section>}
+      {activeProgress && <section className="video-progress-panel"><div><span>{t(activeProgress.phase === "encodingAttempt1" ? "encodingAttemptOne" : activeProgress.phase === "adjustingBitrate" ? "adjustingBitrate" : "videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small></section>}
       {pageError && <div className="page-error"><AlertCircle size={16} />{pageError}</div>}
-      {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelCompression()}><Ban size={19} />{t("cancelVideoCompression")}</button> : <button className="run-button video-compress-button" type="button" disabled={mode === "targetFileSize" || !readyItems.length} title={mode === "targetFileSize" ? t("videoModeNotImplemented") : undefined} onClick={() => void runCompression()}><Clapperboard size={19} />{t("compressVideos")}</button>}
-      {mode === "targetFileSize" && <p className="video-disabled-hint">{t("videoModeNotImplemented")}</p>}
+      {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelCompression()}><Ban size={19} />{t("cancelVideoCompression")}</button> : <button className="run-button video-compress-button" type="button" disabled={targetCompressionBlocked || !readyItems.length} title={targetCompressionBlocked ? t("targetSettingsInvalid") : undefined} onClick={() => void runCompression()}><Clapperboard size={19} />{t("compressVideos")}</button>}
+      {mode === "targetFileSize" && allowAutomaticResolutionReduction && <p className="video-disabled-hint">{t("automaticResolutionNotImplemented")}</p>}
 
       {previewResult && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(null); }}><section className="video-preview-modal" role="dialog" aria-modal="true" aria-label={t("previewVideo")}><header><div><strong>{previewResult.outputName}</strong><small>{previewResult.width} × {previewResult.height} · {previewResult.videoCodec} · {formatDuration(previewResult.durationSeconds)}</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(null)} aria-label={t("closePreview")}><X size={17} /></button></header><video src={convertFileSrc(previewResult.outputPath)} controls autoPlay /></section></div>}
     </div>
