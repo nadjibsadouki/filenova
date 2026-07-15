@@ -76,6 +76,45 @@ pub struct FastTrimResult {
     output_name: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreciseTrimRequest {
+    path: String,
+    destination_dir: Option<String>,
+    preserve_original_format: bool,
+    output_format: String,
+    preserve_metadata: bool,
+    remove_audio: bool,
+    output_name: String,
+    start_seconds: f64,
+    end_seconds: f64,
+    quality: u8,
+    video_codec: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreciseTrimResult {
+    method: String,
+    requested_start_seconds: f64,
+    requested_end_seconds: f64,
+    requested_duration_seconds: f64,
+    final_duration_seconds: f64,
+    duration_difference_seconds: f64,
+    final_format: String,
+    final_video_codec: String,
+    final_audio_codec: Option<String>,
+    quality: u8,
+    width: u64,
+    height: u64,
+    frames_per_second: f64,
+    original_size: u64,
+    final_size: u64,
+    processing_duration_seconds: f64,
+    output_path: String,
+    output_name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FastTrimError {
     code: &'static str,
@@ -127,6 +166,57 @@ pub async fn fast_trim_video(
 
 #[tauri::command]
 pub fn cancel_fast_trim(state: State<'_, TrimVideoState>) -> Result<bool, FastTrimError> {
+    let mut active = state
+        .inner
+        .child
+        .lock()
+        .map_err(|_| FastTrimError::new("trim_failed", "Process lock poisoned."))?;
+    let Some(child) = active.as_mut() else {
+        return Ok(false);
+    };
+    state.inner.cancel_requested.store(true, Ordering::SeqCst);
+    child
+        .kill()
+        .map_err(|error| FastTrimError::new("cancel_failed", error.to_string()))?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn precise_trim_video(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, TrimVideoState>,
+    request: PreciseTrimRequest,
+) -> Result<PreciseTrimResult, FastTrimError> {
+    let ffmpeg = find_sidecar(&app, "ffmpeg")
+        .map_err(|error| FastTrimError::new("ffmpeg_unavailable", error))?;
+    let ffprobe = find_sidecar(&app, "ffprobe")
+        .map_err(|error| FastTrimError::new("ffprobe_unavailable", error))?;
+    let library_dir = runtime_library_dir(&app);
+    let trim_state = state.inner().clone();
+    let progress_window = window.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        precise_trim_with_tools(
+            request,
+            &ffmpeg,
+            &ffprobe,
+            &library_dir,
+            &trim_state,
+            |progress| {
+                let _ = progress_window.emit("precise-trim-progress", progress);
+            },
+        )
+    })
+    .await
+    .map_err(|error| FastTrimError::new("trim_failed", error.to_string()))??;
+    app.asset_protocol_scope()
+        .allow_file(Path::new(&result.output_path))
+        .map_err(|error| FastTrimError::new("output_invalid", error.to_string()))?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn cancel_precise_trim(state: State<'_, TrimVideoState>) -> Result<bool, FastTrimError> {
     let mut active = state
         .inner
         .child
@@ -298,6 +388,314 @@ where
     })
 }
 
+fn precise_trim_with_tools<F>(
+    request: PreciseTrimRequest,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    library_dir: &Path,
+    state: &TrimVideoState,
+    mut report: F,
+) -> Result<PreciseTrimResult, FastTrimError>
+where
+    F: FnMut(FastTrimProgress),
+{
+    let started_at = Instant::now();
+    let input_path = PathBuf::from(&request.path);
+    let input = inspect_video_with_tools(&input_path, ffprobe, ffmpeg, library_dir)
+        .map_err(|error| FastTrimError::new(error.code, error.message))?;
+    validate_trim_selection(
+        request.start_seconds,
+        request.end_seconds,
+        input.duration_seconds,
+    )
+    .map_err(|reason| FastTrimError::new("invalid_trim_selection", reason))?;
+    let source_extension = input_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| FastTrimError::new("format_unavailable", "Missing source container."))?;
+    let container = if request.preserve_original_format {
+        source_extension
+    } else {
+        request.output_format.to_ascii_lowercase()
+    };
+    if !matches!(container.as_str(), "mp4" | "mov" | "mkv" | "webm") {
+        return Err(FastTrimError::new(
+            "format_unavailable",
+            "Precise Cut supports MP4, MOV, MKV and WebM outputs.",
+        ));
+    }
+    if !(1..=100).contains(&request.quality) {
+        return Err(FastTrimError::new(
+            "invalid_quality",
+            "Precise Cut quality must be between 1 and 100.",
+        ));
+    }
+    let (video_encoder, audio_encoder) = precise_encoders(&container, &request.video_codec)?;
+    ensure_encoders_available(
+        ffmpeg,
+        library_dir,
+        video_encoder,
+        (!request.remove_audio && input.audio_codec.is_some()).then_some(audio_encoder),
+    )?;
+    let destination = destination_directory(&input_path, request.destination_dir.as_deref())?;
+    let base_name = sanitized_precise_output_name(&request.output_name, &input_path)?;
+    let temporary = temporary_output_path(&destination, &base_name, &container);
+    verify_destination_writable(&temporary)?;
+    let mut cleanup = TemporaryOutput(Some(temporary.clone()));
+    let requested_duration = request.end_seconds - request.start_seconds;
+    let args = precise_cut_args(
+        &request,
+        &input_path,
+        &temporary,
+        requested_duration,
+        &container,
+        video_encoder,
+        audio_encoder,
+        input.audio_codec.is_some(),
+        input.frames_per_second,
+    );
+    report(FastTrimProgress {
+        path: request.path.clone(),
+        name: input.name.clone(),
+        processed_seconds: 0.0,
+        duration_seconds: requested_duration,
+        percent: 0.0,
+    });
+    run_ffmpeg(
+        ffmpeg,
+        library_dir,
+        state,
+        &args,
+        &request.path,
+        &input.name,
+        requested_duration,
+        &mut report,
+    )?;
+    let verified = validate_precise_output(
+        &temporary,
+        ffprobe,
+        library_dir,
+        requested_duration,
+        request.remove_audio || input.audio_codec.is_none(),
+    )?;
+    let final_output = unique_output_path(&destination, &base_name, &container);
+    fs::rename(&temporary, &final_output)
+        .map_err(|error| FastTrimError::new("destination_inaccessible", error.to_string()))?;
+    cleanup.0 = None;
+    let final_size = fs::metadata(&final_output)
+        .map_err(|error| FastTrimError::new("output_invalid", error.to_string()))?
+        .len();
+    report(FastTrimProgress {
+        path: request.path,
+        name: input.name,
+        processed_seconds: requested_duration,
+        duration_seconds: requested_duration,
+        percent: 100.0,
+    });
+    Ok(PreciseTrimResult {
+        method: "Precise Cut".into(),
+        requested_start_seconds: request.start_seconds,
+        requested_end_seconds: request.end_seconds,
+        requested_duration_seconds: requested_duration,
+        final_duration_seconds: verified.duration_seconds,
+        duration_difference_seconds: verified.duration_seconds - requested_duration,
+        final_format: if container == "webm" {
+            "WebM".into()
+        } else {
+            container.to_ascii_uppercase()
+        },
+        final_video_codec: verified.video_codec,
+        final_audio_codec: verified.audio_codec,
+        quality: request.quality,
+        width: verified.width,
+        height: verified.height,
+        frames_per_second: verified.frames_per_second,
+        original_size: input.size,
+        final_size,
+        processing_duration_seconds: started_at.elapsed().as_secs_f64(),
+        output_name: final_output
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("video-precise-trim")
+            .to_owned(),
+        output_path: final_output.to_string_lossy().into_owned(),
+    })
+}
+
+fn precise_encoders<'a>(
+    container: &str,
+    requested: &'a str,
+) -> Result<(&'a str, &'a str), FastTrimError> {
+    match container {
+        "mp4" | "mov" => Ok(("libopenh264", "aac")),
+        "webm" => Ok(("libsvtav1", "libopus")),
+        "mkv" => match requested.to_ascii_lowercase().as_str() {
+            "auto" | "openh264" => Ok(("libopenh264", "aac")),
+            "svtav1" | "svt-av1" => Ok(("libsvtav1", "libopus")),
+            _ => Err(FastTrimError::new(
+                "encoder_unavailable",
+                "The selected MKV video encoder is unavailable.",
+            )),
+        },
+        _ => Err(FastTrimError::new(
+            "format_unavailable",
+            "Unsupported Precise Cut output format.",
+        )),
+    }
+}
+
+fn ensure_encoders_available(
+    ffmpeg: &Path,
+    library_dir: &Path,
+    video_encoder: &str,
+    audio_encoder: Option<&str>,
+) -> Result<(), FastTrimError> {
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-encoders"])
+        .env("PATH", path_with_runtime_libraries(library_dir))
+        .output()
+        .map_err(|error| FastTrimError::new("ffmpeg_unavailable", error.to_string()))?;
+    if !output.status.success() {
+        return Err(FastTrimError::new(
+            "encoder_unavailable",
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    let encoders = String::from_utf8_lossy(&output.stdout);
+    if !encoders.contains(video_encoder)
+        || audio_encoder.is_some_and(|codec| !encoders.contains(codec))
+    {
+        return Err(FastTrimError::new(
+            "encoder_unavailable",
+            "A required Precise Cut encoder is not present in the bundled FFmpeg build.",
+        ));
+    }
+    Ok(())
+}
+
+fn openh264_quality_value(quality: u8) -> u8 {
+    interpolate_quality(quality, &[(1, 35), (50, 26), (70, 23), (85, 20), (100, 17)])
+}
+
+fn svt_av1_quality_value(quality: u8) -> u8 {
+    interpolate_quality(quality, &[(1, 50), (50, 35), (75, 28), (100, 18)])
+}
+
+fn interpolate_quality(quality: u8, points: &[(u8, u8)]) -> u8 {
+    let quality = quality.clamp(1, 100);
+    for pair in points.windows(2) {
+        let ((left_quality, left_value), (right_quality, right_value)) = (pair[0], pair[1]);
+        if quality <= right_quality {
+            let position = (quality - left_quality) as f64 / (right_quality - left_quality) as f64;
+            return (left_value as f64 + (right_value as f64 - left_value as f64) * position).round()
+                as u8;
+        }
+    }
+    points.last().map(|point| point.1).unwrap_or(23)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn precise_cut_args(
+    request: &PreciseTrimRequest,
+    input: &Path,
+    output: &Path,
+    duration: f64,
+    container: &str,
+    video_encoder: &str,
+    audio_encoder: &str,
+    has_audio: bool,
+    frames_per_second: f64,
+) -> Vec<OsString> {
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-v".into(),
+        "warning".into(),
+        "-n".into(),
+        "-i".into(),
+        input.as_os_str().to_owned(),
+        "-ss".into(),
+        format!("{:.6}", request.start_seconds).into(),
+        "-t".into(),
+        format!("{duration:.6}").into(),
+        "-map".into(),
+        "0:v:0".into(),
+    ];
+    if request.remove_audio || !has_audio {
+        args.push("-an".into());
+    } else {
+        args.extend(["-map".into(), "0:a:0?".into()]);
+    }
+    if request.preserve_metadata {
+        args.extend(["-map_metadata".into(), "0".into()]);
+    } else {
+        args.extend([
+            "-map_metadata".into(),
+            "-1".into(),
+            "-map_chapters".into(),
+            "-1".into(),
+        ]);
+    }
+    args.extend([
+        "-vf".into(),
+        "setpts=PTS-STARTPTS".into(),
+        "-r".into(),
+        format!("{frames_per_second:.6}").into(),
+        "-c:v".into(),
+        video_encoder.into(),
+    ]);
+    if video_encoder == "libopenh264" {
+        let value = openh264_quality_value(request.quality).to_string();
+        args.extend([
+            "-rc_mode".into(),
+            "quality".into(),
+            "-qmin".into(),
+            value.clone().into(),
+            "-qmax".into(),
+            value.into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-profile:v".into(),
+            "main".into(),
+        ]);
+    } else {
+        args.extend([
+            "-crf".into(),
+            svt_av1_quality_value(request.quality).to_string().into(),
+            "-preset".into(),
+            "8".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ]);
+    }
+    if !request.remove_audio && has_audio {
+        args.extend([
+            "-af".into(),
+            "asetpts=PTS-STARTPTS".into(),
+            "-c:a".into(),
+            audio_encoder.into(),
+            "-b:a".into(),
+            if audio_encoder == "libopus" {
+                "128k".into()
+            } else {
+                "160k".into()
+            },
+        ]);
+    }
+    args.extend(["-avoid_negative_ts".into(), "make_zero".into()]);
+    if container == "mp4" {
+        args.extend(["-movflags".into(), "+faststart".into()]);
+    }
+    args.extend([
+        "-progress".into(),
+        "pipe:1".into(),
+        "-nostats".into(),
+        output.as_os_str().to_owned(),
+    ]);
+    args
+}
+
 fn fast_cut_args(
     request: &FastTrimRequest,
     input: &Path,
@@ -459,6 +857,15 @@ struct VerifiedTrim {
     audio_codec: Option<String>,
 }
 
+struct VerifiedPreciseTrim {
+    duration_seconds: f64,
+    video_codec: String,
+    audio_codec: Option<String>,
+    width: u64,
+    height: u64,
+    frames_per_second: f64,
+}
+
 fn validate_trim_output(
     path: &Path,
     ffprobe: &Path,
@@ -538,6 +945,119 @@ fn validate_trim_output(
     })
 }
 
+fn validate_precise_output(
+    path: &Path,
+    ffprobe: &Path,
+    library_dir: &Path,
+    requested_duration: f64,
+    audio_removed: bool,
+) -> Result<VerifiedPreciseTrim, FastTrimError> {
+    let size = fs::metadata(path)
+        .map_err(|error| FastTrimError::new("output_invalid", error.to_string()))?
+        .len();
+    if size == 0 {
+        return Err(FastTrimError::new(
+            "output_empty",
+            "The precise trim output is empty.",
+        ));
+    }
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path)
+        .env("PATH", path_with_runtime_libraries(library_dir))
+        .output()
+        .map_err(|error| FastTrimError::new("ffprobe_unavailable", error.to_string()))?;
+    if !output.status.success() {
+        return Err(FastTrimError::new(
+            "output_invalid",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| FastTrimError::new("output_invalid", error.to_string()))?;
+    let streams = document["streams"]
+        .as_array()
+        .ok_or_else(|| FastTrimError::new("output_invalid", "FFprobe found no output streams."))?;
+    let video = streams
+        .iter()
+        .find(|stream| stream["codec_type"].as_str() == Some("video"))
+        .ok_or_else(|| FastTrimError::new("output_invalid", "No valid video stream found."))?;
+    let audio = streams
+        .iter()
+        .find(|stream| stream["codec_type"].as_str() == Some("audio"));
+    if audio_removed && audio.is_some() {
+        return Err(FastTrimError::new(
+            "output_invalid",
+            "The output unexpectedly contains audio.",
+        ));
+    }
+    let duration = document["format"]["duration"]
+        .as_str()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| FastTrimError::new("output_invalid", "The output duration is invalid."))?;
+    let fps = parse_frame_rate(video["avg_frame_rate"].as_str().unwrap_or("0/1"));
+    // Two output frames or 120 ms (whichever is greater) covers encoder/container
+    // rounding while still detecting cuts that are visibly imprecise.
+    let duration_tolerance = (if fps > 0.0 { 2.0 / fps } else { 0.0 }).max(0.120);
+    if (duration - requested_duration).abs() > duration_tolerance {
+        return Err(FastTrimError::new(
+            "output_duration_invalid",
+            format!("Precise Cut differs by more than the documented {duration_tolerance:.3}s tolerance."),
+        ));
+    }
+    if let Some(audio) = audio {
+        let video_duration = stream_duration(video).unwrap_or(duration);
+        let audio_duration = stream_duration(audio).unwrap_or(duration);
+        let sync_tolerance = duration_tolerance.max(0.200);
+        if (video_duration - audio_duration).abs() > sync_tolerance {
+            return Err(FastTrimError::new(
+                "output_desynchronized",
+                format!("Audio and video differ by more than {sync_tolerance:.3}s."),
+            ));
+        }
+    }
+    Ok(VerifiedPreciseTrim {
+        duration_seconds: duration,
+        video_codec: video["codec_name"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_ascii_uppercase(),
+        audio_codec: audio
+            .and_then(|stream| stream["codec_name"].as_str())
+            .map(str::to_ascii_uppercase),
+        width: video["width"].as_u64().unwrap_or(0),
+        height: video["height"].as_u64().unwrap_or(0),
+        frames_per_second: fps,
+    })
+}
+
+fn stream_duration(stream: &serde_json::Value) -> Option<f64> {
+    stream["duration"]
+        .as_str()?
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn parse_frame_rate(value: &str) -> f64 {
+    let (numerator, denominator) = value.split_once('/').unwrap_or((value, "1"));
+    let numerator = numerator.parse::<f64>().unwrap_or(0.0);
+    let denominator = denominator.parse::<f64>().unwrap_or(1.0);
+    if denominator > 0.0 {
+        numerator / denominator
+    } else {
+        0.0
+    }
+}
+
 fn detect_previous_keyframe(
     input: &Path,
     ffprobe: &Path,
@@ -576,6 +1096,34 @@ fn sanitized_output_name(requested: &str, input: &Path) -> Result<String, FastTr
     let requested = requested.trim();
     let fallback = format!(
         "{}-trimmed",
+        input
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("video")
+    );
+    let value = if requested.is_empty() {
+        fallback.as_str()
+    } else {
+        requested
+    };
+    if value.contains(['/', '\\']) || matches!(value, "." | "..") {
+        return Err(FastTrimError::new(
+            "invalid_output_name",
+            "The output file name is invalid.",
+        ));
+    }
+    Ok(Path::new(value)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&fallback)
+        .to_owned())
+}
+
+fn sanitized_precise_output_name(requested: &str, input: &Path) -> Result<String, FastTrimError> {
+    let requested = requested.trim();
+    let fallback = format!(
+        "{}-precise-trim",
         input
             .file_stem()
             .and_then(|value| value.to_str())
@@ -659,6 +1207,11 @@ fn classify_ffmpeg_error(stderr: &str) -> FastTrimError {
     let lower = stderr.to_ascii_lowercase();
     let code = if lower.contains("no space left") || lower.contains("not enough space") {
         "disk_full"
+    } else if lower.contains("unknown encoder")
+        || lower.contains("error setting encoder")
+        || lower.contains("error while opening encoder")
+    {
+        "encoder_unavailable"
     } else if lower.contains("could not find tag")
         || lower.contains("not currently supported in container")
     {
@@ -753,6 +1306,282 @@ mod tests {
             start_seconds: start,
             end_seconds: end,
         }
+    }
+
+    fn precise_request(
+        path: &Path,
+        destination: &Path,
+        start: f64,
+        end: f64,
+    ) -> PreciseTrimRequest {
+        PreciseTrimRequest {
+            path: path.to_string_lossy().into_owned(),
+            destination_dir: Some(destination.to_string_lossy().into_owned()),
+            preserve_original_format: true,
+            output_format: "mp4".into(),
+            preserve_metadata: false,
+            remove_audio: false,
+            output_name: "video-precise-trim".into(),
+            start_seconds: start,
+            end_seconds: end,
+            quality: 75,
+            video_codec: "auto".into(),
+        }
+    }
+
+    #[test]
+    fn precise_args_reencode_with_validated_quality_options_and_never_copy_video() {
+        let mut req = precise_request(Path::new("C:\\in.mp4"), Path::new("C:\\"), 1.137, 3.789);
+        for quality in [1, 75, 100] {
+            req.quality = quality;
+            let args = precise_cut_args(
+                &req,
+                Path::new("C:\\in.mp4"),
+                Path::new("C:\\out.mp4"),
+                2.652,
+                "mp4",
+                "libopenh264",
+                "aac",
+                true,
+                30.0,
+            )
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+            assert!(args.contains("-i C:\\in.mp4 -ss 1.137000 -t 2.652000"));
+            assert!(args.contains("-c:v libopenh264 -rc_mode quality"));
+            assert!(args.contains("-pix_fmt yuv420p -profile:v main"));
+            assert!(args.contains("-c:a aac -b:a 160k"));
+            assert!(args.contains("-movflags +faststart"));
+            for forbidden in ["-c copy", "libx264", "preset medium", "-pass", "passlog"] {
+                assert!(!args.contains(forbidden));
+            }
+        }
+        assert_eq!(openh264_quality_value(1), 35);
+        assert_eq!(openh264_quality_value(70), 23);
+        assert_eq!(openh264_quality_value(100), 17);
+        assert_eq!(svt_av1_quality_value(1), 50);
+        assert_eq!(svt_av1_quality_value(75), 28);
+        assert_eq!(svt_av1_quality_value(100), 18);
+    }
+
+    #[test]
+    fn really_precise_trims_mp4_at_milliseconds_between_keyframes_and_preserves_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("outputs");
+        fs::create_dir(&destination).unwrap();
+        let source = temp.path().join("source.mp4");
+        create_source(&source, 6);
+        let original = fs::read(&source).unwrap();
+        let result = precise_trim_with_tools(
+            precise_request(&source, &destination, 1.137, 3.789),
+            &tool("ffmpeg"),
+            &tool("ffprobe"),
+            &libraries(),
+            &TrimVideoState::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result.final_video_codec, "H264");
+        assert_eq!(result.final_audio_codec.as_deref(), Some("AAC"));
+        assert!((result.final_duration_seconds - 2.652).abs() <= 0.120);
+        assert!(result.duration_difference_seconds.abs() <= 0.120);
+        assert_eq!((result.width, result.height), (320, 180));
+        assert!((result.frames_per_second - 30.0).abs() < 0.01);
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn really_precise_converts_mov_to_mp4_and_mp4_to_webm() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("outputs");
+        fs::create_dir(&destination).unwrap();
+        let mov = temp.path().join("source.mov");
+        create_source(&mov, 4);
+        let mut mp4_req = precise_request(&mov, &destination, 0.333, 2.666);
+        mp4_req.preserve_original_format = false;
+        mp4_req.output_format = "mp4".into();
+        let mp4 = precise_trim_with_tools(
+            mp4_req,
+            &tool("ffmpeg"),
+            &tool("ffprobe"),
+            &libraries(),
+            &TrimVideoState::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(mp4.final_format, "MP4");
+        assert_eq!(mp4.final_video_codec, "H264");
+
+        let mut webm_req = precise_request(Path::new(&mp4.output_path), &destination, 0.111, 1.777);
+        webm_req.preserve_original_format = false;
+        webm_req.output_format = "webm".into();
+        webm_req.quality = 25;
+        let webm = precise_trim_with_tools(
+            webm_req,
+            &tool("ffmpeg"),
+            &tool("ffprobe"),
+            &libraries(),
+            &TrimVideoState::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(webm.final_format, "WebM");
+        assert_eq!(webm.final_video_codec, "AV1");
+        assert_eq!(webm.final_audio_codec.as_deref(), Some("OPUS"));
+    }
+
+    #[test]
+    fn precise_mkv_supports_openh264_metadata_no_audio_and_unique_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("outputs");
+        fs::create_dir(&destination).unwrap();
+        let source = temp.path().join("source.mkv");
+        create_source(&source, 4);
+        let original = fs::read(&source).unwrap();
+        for index in 0..2 {
+            let mut req = precise_request(&source, &destination, 0.567, 2.901);
+            req.remove_audio = true;
+            req.preserve_metadata = true;
+            req.quality = if index == 0 { 20 } else { 95 };
+            req.video_codec = "openh264".into();
+            let result = precise_trim_with_tools(
+                req,
+                &tool("ffmpeg"),
+                &tool("ffprobe"),
+                &libraries(),
+                &TrimVideoState::default(),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(result.final_video_codec, "H264");
+            assert_eq!(result.final_audio_codec, None);
+            assert_eq!(
+                result.output_name,
+                if index == 0 {
+                    "video-precise-trim.mkv"
+                } else {
+                    "video-precise-trim-2.mkv"
+                }
+            );
+            let metadata = Command::new(tool("ffprobe"))
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format_tags=title",
+                    "-of",
+                    "default=nw=1",
+                ])
+                .arg(&result.output_path)
+                .env("PATH", path_with_runtime_libraries(&libraries()))
+                .output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&metadata.stdout).contains("FileNova Fast Cut"));
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn precise_is_frame_accurate_between_keyframes_and_fast_cut_remains_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("outputs");
+        fs::create_dir(&destination).unwrap();
+        let source = temp.path().join("source.mp4");
+        create_source(&source, 6);
+        let fast = fast_trim_with_tools(
+            request(&source, &destination, 1.137, 3.789),
+            &tool("ffmpeg"),
+            &tool("ffprobe"),
+            &libraries(),
+            &TrimVideoState::default(),
+            |_| {},
+        )
+        .unwrap();
+        let precise = precise_trim_with_tools(
+            precise_request(&source, &destination, 1.137, 3.789),
+            &tool("ffmpeg"),
+            &tool("ffprobe"),
+            &libraries(),
+            &TrimVideoState::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert!(fast.keyframe_offset_seconds.abs() > 0.5);
+        assert!(precise.duration_difference_seconds.abs() <= 0.120);
+        assert!(fast.processing_duration_seconds > 0.0);
+        assert!(precise.processing_duration_seconds > 0.0);
+        eprintln!(
+            "Fast Cut: keyframe offset={:.3}s, output duration={:.3}s, processing={:.3}s; Precise Cut: duration difference={:.3}s, output duration={:.3}s, processing={:.3}s",
+            fast.keyframe_offset_seconds,
+            fast.final_duration_seconds,
+            fast.processing_duration_seconds,
+            precise.duration_difference_seconds,
+            precise.final_duration_seconds,
+            precise.processing_duration_seconds,
+        );
+    }
+
+    #[test]
+    fn cancelling_precise_encoding_removes_temporary_output_and_preserves_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.mp4");
+        let output = temp.path().join(".precise-cancelled.tmp.mp4");
+        create_source(&source, 8);
+        let original = fs::read(&source).unwrap();
+        let state = TrimVideoState::default();
+        let worker_state = state.clone();
+        let worker_source = source.clone();
+        let worker_output = output.clone();
+        let worker = thread::spawn(move || {
+            let _cleanup = TemporaryOutput(Some(worker_output.clone()));
+            let request = precise_request(
+                &worker_source,
+                worker_source.parent().unwrap(),
+                0.333,
+                7.333,
+            );
+            let mut args = precise_cut_args(
+                &request,
+                &worker_source,
+                &worker_output,
+                7.0,
+                "mp4",
+                "libopenh264",
+                "aac",
+                true,
+                30.0,
+            );
+            let input_position = args.iter().position(|value| value == "-i").unwrap();
+            args.insert(input_position, "-re".into());
+            run_ffmpeg(
+                &tool("ffmpeg"),
+                &libraries(),
+                &worker_state,
+                &args,
+                &worker_source.to_string_lossy(),
+                "source.mp4",
+                7.0,
+                &mut |_| {},
+            )
+        });
+        let mut killed = false;
+        for _ in 0..1000 {
+            if let Ok(mut active) = state.inner.child.lock() {
+                if let Some(child) = active.as_mut() {
+                    state.inner.cancel_requested.store(true, Ordering::SeqCst);
+                    child.kill().unwrap();
+                    killed = true;
+                    break;
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(killed);
+        assert_eq!(worker.join().unwrap().unwrap_err().code, "trim_cancelled");
+        assert!(!output.exists());
+        assert_eq!(fs::read(&source).unwrap(), original);
     }
 
     #[test]

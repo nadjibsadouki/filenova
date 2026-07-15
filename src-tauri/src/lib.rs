@@ -30,7 +30,9 @@ use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
 use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_output};
 use resizing::resize_image;
-use trim_video::{cancel_fast_trim, fast_trim_video, TrimVideoState};
+use trim_video::{
+    cancel_fast_trim, cancel_precise_trim, fast_trim_video, precise_trim_video, TrimVideoState,
+};
 use trim_video_plan::allow_trim_video_preview;
 use video_compression::{
     cancel_video_compression, compress_recommended_video, delete_video_result,
@@ -83,7 +85,9 @@ pub fn run() {
             cancel_audio_extraction,
             allow_trim_video_preview,
             fast_trim_video,
-            cancel_fast_trim
+            cancel_fast_trim,
+            precise_trim_video,
+            cancel_precise_trim
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");
