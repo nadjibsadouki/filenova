@@ -6,6 +6,7 @@ mod pdf_organize;
 mod pdf_split;
 mod pdf_to_images;
 mod resizing;
+mod video_tools;
 
 use compression::{compress_image, inspect_image};
 use conversion::{convert_image, inspect_convertible_image};
@@ -21,6 +22,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            video_tools::log_tool_versions(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             inspect_image,
             compress_image,

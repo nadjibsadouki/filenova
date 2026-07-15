@@ -25,8 +25,13 @@
     "active": true,
     "targets": "all",
     "useLocalToolsDir": true,
+    "externalBin": [
+      "binaries/ffmpeg",
+      "binaries/ffprobe"
+    ],
     "resources": {
       "resources/pdfium/": "pdfium/",
+      "resources/ffmpeg/": "ffmpeg/",
       "../THIRD_PARTY_LICENSES.txt": "THIRD_PARTY_LICENSES.txt"
     },
     "icon": [

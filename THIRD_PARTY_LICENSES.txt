@@ -59,3 +59,31 @@ chain added for PDF rendering and output encoding has these declared licenses:
 No AGPL dependency and no dependency requiring a commercial runtime license was
 found. The full pdfium-render dual-license text is bundled as
 pdfium/licenses/pdfium-render.md.
+
+FFmpeg and FFprobe n7.1.5-1-g7d0e842004-20260630
+------------------------------------------------
+Copyright 2000-2026 the FFmpeg developers.
+Exact binary license: GNU Lesser General Public License version 3 or later
+(LGPL-3.0-or-later). The build enables `--enable-version3`, so it must not be
+described merely as an LGPL-2.1 build.
+
+FileNova distributes the unmodified command-line programs as separate Tauri
+sidecars and the FFmpeg libraries as their original, dynamically linked DLLs.
+FileNova is not linked to the FFmpeg libraries. The complete LGPL v3 text from
+the binary archive is bundled as ffmpeg/LICENSE-FFMPEG.txt. Exact build and
+source information is bundled as ffmpeg/BUILD_INFO.txt.
+
+Binary provider: BtbN/FFmpeg-Builds, win64-lgpl-shared 7.1 variant.
+Release: autobuild-2026-06-30-13-34.
+Binary archive: ffmpeg-n7.1.5-1-g7d0e842004-win64-lgpl-shared-7.1.zip
+Archive SHA-256: 03A8003E245C08DF4277D7B0ADC50B93A97DDD4A3AAAFEA21943C4384DF59895
+Source/build scripts: https://github.com/BtbN/FFmpeg-Builds/tree/7a83528
+Corresponding FFmpeg revision: https://github.com/FFmpeg/FFmpeg/commit/7d0e842004
+
+The recorded configure line contains neither `--enable-gpl` nor
+`--enable-nonfree`. It explicitly disables libx264, libx265, libxvid,
+libfdk-aac, frei0r, rubberband and vidstab. Commercial distribution is
+permitted under LGPL-3.0-or-later provided its notice, source-availability,
+replacement/relinking, and reverse-engineering requirements are honored.
+Codec patent obligations are separate and depend on the formats used and the
+jurisdictions where FileNova is distributed.

@@ -1,0 +1,53 @@
+FileNova FFmpeg sidecars - pinned build record
+================================================
+
+Component versions
+------------------
+FFmpeg:  n7.1.5-1-g7d0e842004-20260630
+FFprobe: n7.1.5-1-g7d0e842004-20260630
+Compiler: gcc 15.2.0 (crosstool-NG 1.28.0.23_185f348)
+Target: Windows x86_64, dynamically linked shared build
+
+Provenance
+----------
+Provider: BtbN/FFmpeg-Builds
+Variant: win64-lgpl-shared, FFmpeg 7.1 release branch
+Release: autobuild-2026-06-30-13-34
+Build scripts revision: 7a83528
+Archive: ffmpeg-n7.1.5-1-g7d0e842004-win64-lgpl-shared-7.1.zip
+Archive SHA-256: 03A8003E245C08DF4277D7B0ADC50B93A97DDD4A3AAAFEA21943C4384DF59895
+Archive URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n7.1.5-1-g7d0e842004-win64-lgpl-shared-7.1.zip
+Build scripts: https://github.com/BtbN/FFmpeg-Builds/tree/7a83528
+FFmpeg source revision: https://github.com/FFmpeg/FFmpeg/commit/7d0e842004
+
+Exact license
+-------------
+The binaries report GNU Lesser General Public License version 3 or later
+(LGPL-3.0-or-later). This is caused by --enable-version3. The complete license
+text supplied in the binary archive is in LICENSE-FFMPEG.txt.
+
+Forbidden-feature audit
+-----------------------
+The exact configure line below contains neither --enable-gpl nor
+--enable-nonfree. It includes --disable-libfdk-aac, --disable-libx264,
+--disable-libx265, --disable-libxvid, --disable-frei0r,
+--disable-librubberband and --disable-libvidstab.
+
+Configure line reported by both ffmpeg -version and ffprobe -version
+--------------------------------------------------------------------
+--prefix=/ffbuild/prefix --pkg-config-flags=--static --pkg-config=pkg-config --cross-prefix=x86_64-w64-mingw32- --arch=x86_64 --target-os=mingw32 --enable-version3 --disable-debug --enable-shared --disable-static --disable-w32threads --enable-pthreads --enable-iconv --enable-zlib --enable-libxml2 --enable-libvmaf --enable-fontconfig --enable-libharfbuzz --enable-libfreetype --enable-libfribidi --enable-vulkan --enable-libshaderc --enable-libvorbis --disable-libxcb --disable-xlib --disable-libpulse --enable-gmp --enable-lzma --disable-liblcevc-dec --enable-opencl --enable-amf --enable-libaom --enable-libaribb24 --disable-avisynth --enable-chromaprint --enable-libdav1d --disable-libdavs2 --disable-libdvdread --disable-libdvdnav --disable-libfdk-aac --enable-ffnvcodec --enable-cuda-llvm --disable-frei0r --enable-libgme --enable-libkvazaar --enable-libaribcaption --enable-libass --enable-libbluray --enable-libjxl --enable-libmp3lame --enable-libopus --enable-libplacebo --enable-librist --enable-libssh --enable-libtheora --enable-libvpx --enable-libwebp --enable-libzmq --enable-lv2 --enable-libvpl --enable-openal --enable-libopencore-amrnb --enable-libopencore-amrwb --enable-libopenh264 --enable-libopenjpeg --enable-libopenmpt --enable-librav1e --disable-librubberband --enable-schannel --enable-sdl2 --enable-libsnappy --enable-libsoxr --enable-libsrt --enable-libsvtav1 --enable-libtwolame --enable-libuavs3d --disable-libdrm --enable-vaapi --disable-libvidstab --enable-libvvenc --disable-libx264 --disable-libx265 --disable-libxavs2 --disable-libxvid --enable-libzimg --enable-libzvbi --extra-cflags=-DLIBTWOLAME_STATIC --extra-cxxflags= --extra-libs=-lgomp --extra-ldflags=-pthread --extra-ldexeflags= --cc=x86_64-w64-mingw32-gcc --cxx=x86_64-w64-mingw32-g++ --ar=x86_64-w64-mingw32-gcc-ar --ranlib=x86_64-w64-mingw32-gcc-ranlib --nm=x86_64-w64-mingw32-gcc-nm --extra-version=20260630
+
+Distribution notes
+------------------
+Tauri bundles ffmpeg.exe and ffprobe.exe through bundle.externalBin and copies
+this ffmpeg resource directory, including all seven required DLLs, into every
+future bundle. The standard configuration and the dedicated offline overlay
+therefore inherit the same sidecars and resources. Development uses the
+target-suffixed executables directly from src-tauri/binaries and these same
+DLLs. End users do not need FFmpeg installed.
+
+LGPL compliance requires preserving notices and the license, allowing library
+replacement/debugging, and making the exact corresponding source available.
+Before publishing an installer, host the corresponding source archive alongside
+the FileNova download and retain the source/build URLs above. Codec patent
+licensing is a separate commercial-distribution consideration.
