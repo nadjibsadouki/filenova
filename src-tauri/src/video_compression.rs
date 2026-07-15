@@ -46,6 +46,8 @@ pub struct VideoCompressionRequest {
     remove_audio: bool,
     preserve_metadata: bool,
     output_format: String,
+    quality: Option<u8>,
+    estimated_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +75,16 @@ pub struct VideoCompressionResult {
     output_path: String,
     output_name: String,
     no_size_reduction: bool,
+    quality: Option<u8>,
+    encoding_setting: String,
+    estimated_size: Option<u64>,
+    estimate_difference: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebmEncoder {
+    SvtAv1,
+    Vp9,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,12 +198,17 @@ fn compress_with_tools<F>(
 where
     F: FnMut(VideoCompressionProgress),
 {
-    if request.mode != "recommended" {
+    if request.mode != "recommended" && request.mode != "targetQuality" {
         return Err(VideoCompressionError::new(
             "mode_not_implemented",
-            "Only Recommended mode is implemented.",
+            "Target File Size is not implemented.",
         ));
     }
+    let selected_quality = if request.mode == "targetQuality" {
+        Some(request.quality.unwrap_or(70).clamp(1, 100))
+    } else {
+        None
+    };
     let output_extension = match request.output_format.as_str() {
         "mp4" => "mp4",
         "webm" => "webm",
@@ -224,7 +241,18 @@ where
     let temporary = temporary_output_path(&destination, &base_name, output_extension);
     verify_destination_writable(&temporary)?;
 
-    let args = recommended_ffmpeg_args(&request, &input_path, &temporary);
+    let webm_encoder = if request.output_format == "webm" {
+        Some(detect_webm_encoder(ffmpeg, library_dir)?)
+    } else {
+        None
+    };
+    let (args, encoding_setting) = ffmpeg_args(
+        &request,
+        selected_quality,
+        webm_encoder,
+        &input_path,
+        &temporary,
+    );
     let mut command = Command::new(ffmpeg);
     command
         .args(&args)
@@ -358,6 +386,9 @@ where
     } else {
         (saved_bytes as f64 / input.size as f64) * 100.0
     };
+    let estimate_difference = request
+        .estimated_size
+        .map(|estimate| compressed_size as i64 - estimate as i64);
     report(VideoCompressionProgress {
         path: request.path,
         name: input_name,
@@ -383,6 +414,10 @@ where
             .to_owned(),
         output_path: final_output.to_string_lossy().into_owned(),
         no_size_reduction,
+        quality: selected_quality,
+        encoding_setting,
+        estimated_size: request.estimated_size,
+        estimate_difference,
     })
 }
 
@@ -455,11 +490,13 @@ fn verify_destination_writable(path: &Path) -> Result<(), VideoCompressionError>
     }
 }
 
-fn recommended_ffmpeg_args(
+fn ffmpeg_args(
     request: &VideoCompressionRequest,
+    selected_quality: Option<u8>,
+    webm_encoder: Option<WebmEncoder>,
     input: &Path,
     output: &Path,
-) -> Vec<OsString> {
+) -> (Vec<OsString>, String) {
     let mut args = vec![
         "-hide_banner".into(),
         "-nostdin".into(),
@@ -493,36 +530,74 @@ fn recommended_ffmpeg_args(
         ]);
     }
 
-    match request.output_format.as_str() {
+    let encoding_setting = match request.output_format.as_str() {
         "mp4" => {
             // libx264 is intentionally absent from the LGPL build. OpenH264 quality mode with
             // global_quality 24 is the closest available equivalent to CRF 24; it has no presets.
-            args.extend([
-                "-c:v".into(),
-                "libopenh264".into(),
-                "-rc_mode".into(),
-                "quality".into(),
-                "-global_quality".into(),
-                RECOMMENDED_QUALITY.to_string().into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-            ]);
+            args.extend(["-c:v".into(), "libopenh264".into()]);
+            if let Some(quality) = selected_quality {
+                let crf_target = quality_to_h264_crf(quality);
+                // OpenH264 exposes no CRF or preset. Equal QP bounds in quality mode are
+                // its supported constant-quality equivalent and preserve the requested curve.
+                args.extend([
+                    "-rc_mode".into(),
+                    "quality".into(),
+                    "-qmin".into(),
+                    crf_target.to_string().into(),
+                    "-qmax".into(),
+                    crf_target.to_string().into(),
+                ]);
+            } else {
+                args.extend([
+                    "-rc_mode".into(),
+                    "quality".into(),
+                    "-global_quality".into(),
+                    RECOMMENDED_QUALITY.to_string().into(),
+                ]);
+            }
+            args.extend(["-pix_fmt".into(), "yuv420p".into()]);
             if !request.remove_audio {
                 args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "160k".into()]);
             }
             args.extend(["-movflags".into(), "+faststart".into()]);
+            if let Some(quality) = selected_quality {
+                let crf_target = quality_to_h264_crf(quality);
+                format!("OpenH264 fixed QP · qmin/qmax {crf_target} · CRF target {crf_target} · quality {quality}")
+            } else {
+                format!("OpenH264 quality mode · global_quality {RECOMMENDED_QUALITY}")
+            }
         }
         "webm" => {
-            args.extend([
-                "-c:v".into(),
-                "libsvtav1".into(),
-                "-crf".into(),
-                WEBM_CRF.to_string().into(),
-                "-preset".into(),
-                WEBM_PRESET.to_string().into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-            ]);
+            let encoder = webm_encoder.unwrap_or(WebmEncoder::SvtAv1);
+            let crf = selected_quality
+                .map(quality_to_webm_crf)
+                .unwrap_or(WEBM_CRF);
+            match encoder {
+                WebmEncoder::SvtAv1 => args.extend([
+                    "-c:v".into(),
+                    "libsvtav1".into(),
+                    "-crf".into(),
+                    crf.to_string().into(),
+                    "-preset".into(),
+                    WEBM_PRESET.to_string().into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]),
+                WebmEncoder::Vp9 => args.extend([
+                    "-c:v".into(),
+                    "libvpx-vp9".into(),
+                    "-crf".into(),
+                    crf.to_string().into(),
+                    "-b:v".into(),
+                    "0".into(),
+                    "-deadline".into(),
+                    "good".into(),
+                    "-cpu-used".into(),
+                    "2".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]),
+            }
             if !request.remove_audio {
                 args.extend([
                     "-c:a".into(),
@@ -531,16 +606,66 @@ fn recommended_ffmpeg_args(
                     "128k".into(),
                 ]);
             }
+            match encoder {
+                WebmEncoder::SvtAv1 => {
+                    format!("SVT-AV1 constant quality · CRF {crf} · preset {WEBM_PRESET}")
+                }
+                WebmEncoder::Vp9 => format!("VP9 constant quality · CRF {crf} · bitrate 0"),
+            }
         }
-        _ => {}
-    }
+        _ => String::new(),
+    };
     args.extend([
         "-progress".into(),
         "pipe:1".into(),
         "-nostats".into(),
         output.as_os_str().to_owned(),
     ]);
-    args
+    (args, encoding_setting)
+}
+
+fn interpolate_quality(quality: u8, points: &[(u8, u8)]) -> u8 {
+    let quality = quality.clamp(1, 100);
+    for pair in points.windows(2) {
+        let (left_quality, left_value) = pair[0];
+        let (right_quality, right_value) = pair[1];
+        if quality <= right_quality {
+            let progress = (quality - left_quality) as f64 / (right_quality - left_quality) as f64;
+            return (left_value as f64 + progress * (right_value as f64 - left_value as f64)).round()
+                as u8;
+        }
+    }
+    points.last().map(|point| point.1).unwrap_or(quality)
+}
+
+fn quality_to_h264_crf(quality: u8) -> u8 {
+    interpolate_quality(quality, &[(1, 35), (50, 26), (70, 23), (85, 20), (100, 17)])
+}
+
+fn quality_to_webm_crf(quality: u8) -> u8 {
+    interpolate_quality(quality, &[(1, 50), (50, 36), (70, 30), (85, 24), (100, 18)])
+}
+
+fn detect_webm_encoder(
+    ffmpeg: &Path,
+    library_dir: &Path,
+) -> Result<WebmEncoder, VideoCompressionError> {
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-encoders"])
+        .env("PATH", path_with_runtime_libraries(library_dir))
+        .output()
+        .map_err(|error| VideoCompressionError::new("ffmpeg_unavailable", error.to_string()))?;
+    let encoders = String::from_utf8_lossy(&output.stdout);
+    if encoders.contains("libsvtav1") {
+        Ok(WebmEncoder::SvtAv1)
+    } else if encoders.contains("libvpx-vp9") {
+        Ok(WebmEncoder::Vp9)
+    } else {
+        Err(VideoCompressionError::new(
+            "unsupported_codec",
+            "The bundled FFmpeg has no supported AV1 or VP9 WebM encoder.",
+        ))
+    }
 }
 
 fn classify_ffmpeg_error(stderr: &str) -> VideoCompressionError {
@@ -646,6 +771,33 @@ mod tests {
         );
     }
 
+    fn create_silent_source(path: &Path) {
+        let output = Command::new(bundled_tool("ffmpeg"))
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=12",
+                "-t",
+                "1",
+                "-c:v",
+                "mpeg4",
+                "-an",
+            ])
+            .arg(path)
+            .env("PATH", path_with_runtime_libraries(&library_dir()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn request(path: &Path, destination: &Path, output_format: &str) -> VideoCompressionRequest {
         VideoCompressionRequest {
             path: path.to_string_lossy().into_owned(),
@@ -655,7 +807,83 @@ mod tests {
             remove_audio: false,
             preserve_metadata: true,
             output_format: output_format.into(),
+            quality: None,
+            estimated_size: None,
         }
+    }
+
+    fn target_request(
+        path: &Path,
+        destination: &Path,
+        output_format: &str,
+        quality: u8,
+    ) -> VideoCompressionRequest {
+        let mut request = request(path, destination, output_format);
+        request.mode = "targetQuality".into();
+        request.quality = Some(quality);
+        request.estimated_size = Some(42_000);
+        request
+    }
+
+    #[test]
+    fn target_quality_curve_matches_all_required_control_points() {
+        assert_eq!(quality_to_h264_crf(1), 35);
+        assert_eq!(quality_to_h264_crf(50), 26);
+        assert_eq!(quality_to_h264_crf(70), 23);
+        assert_eq!(quality_to_h264_crf(85), 20);
+        assert_eq!(quality_to_h264_crf(100), 17);
+        assert!(quality_to_h264_crf(30) > quality_to_h264_crf(70));
+        assert!(quality_to_h264_crf(70) > quality_to_h264_crf(95));
+    }
+
+    #[test]
+    fn target_quality_uses_only_options_supported_by_each_encoder() {
+        let input = Path::new("C:\\input.mp4");
+        let mp4 = target_request(input, Path::new("C:\\"), "mp4", 70);
+        let (args, setting) = ffmpeg_args(&mp4, Some(70), None, input, Path::new("C:\\output.mp4"));
+        let joined = args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("-c:v libopenh264 -rc_mode quality -qmin 23 -qmax 23"));
+        assert!(joined.contains("-pix_fmt yuv420p"));
+        assert!(joined.contains("-movflags +faststart"));
+        assert!(joined.contains("-c:a aac"));
+        assert!(!joined.contains("-preset medium"));
+        assert!(setting.contains("qmin/qmax 23"));
+
+        let webm = target_request(input, Path::new("C:\\"), "webm", 85);
+        let (svt_args, _) = ffmpeg_args(
+            &webm,
+            Some(85),
+            Some(WebmEncoder::SvtAv1),
+            input,
+            Path::new("C:\\output.webm"),
+        );
+        let svt = svt_args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(svt.contains("-c:v libsvtav1 -crf 24 -preset 8"));
+        assert!(!svt.contains("-b:v 0"));
+        assert!(svt.contains("-c:a libopus"));
+
+        let (vp9_args, _) = ffmpeg_args(
+            &webm,
+            Some(85),
+            Some(WebmEncoder::Vp9),
+            input,
+            Path::new("C:\\output.webm"),
+        );
+        let vp9 = vp9_args
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(vp9.contains("-c:v libvpx-vp9 -crf 24 -b:v 0"));
+        assert!(!vp9.contains("-preset"));
     }
 
     #[test]
@@ -664,7 +892,8 @@ mod tests {
         let output = Path::new("C:\\output.mp4");
         let mut req = request(input, Path::new("C:\\"), "mp4");
         req.preserve_metadata = false;
-        let joined = recommended_ffmpeg_args(&req, input, output)
+        let joined = ffmpeg_args(&req, None, None, input, output)
+            .0
             .iter()
             .map(|value| value.to_string_lossy())
             .collect::<Vec<_>>()
@@ -681,11 +910,18 @@ mod tests {
         req.output_format = "webm".into();
         req.preserve_resolution = false;
         req.remove_audio = true;
-        let joined = recommended_ffmpeg_args(&req, input, Path::new("C:\\output.webm"))
-            .iter()
-            .map(|value| value.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let joined = ffmpeg_args(
+            &req,
+            None,
+            Some(WebmEncoder::SvtAv1),
+            input,
+            Path::new("C:\\output.webm"),
+        )
+        .0
+        .iter()
+        .map(|value| value.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
         assert!(joined.contains("-c:v libsvtav1 -crf 34 -preset 8"));
         assert!(joined.contains("scale="));
         assert!(joined.contains("-an"));
@@ -754,6 +990,77 @@ mod tests {
     }
 
     #[test]
+    fn target_quality_compresses_real_files_at_30_70_95_and_handles_audio_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("outputs");
+        fs::create_dir(&output_dir).unwrap();
+        let source = temp.path().join("quality-source.mp4");
+        let silent = temp.path().join("silent.mp4");
+        create_source(&source, "mp4");
+        create_silent_source(&silent);
+        let original = fs::read(&source).unwrap();
+        let silent_original = fs::read(&silent).unwrap();
+        let state = VideoCompressionState::default();
+        let mut sizes = Vec::new();
+
+        for quality in [30, 70, 95] {
+            let result = compress_with_tools(
+                target_request(&source, &output_dir, "mp4", quality),
+                &bundled_tool("ffmpeg"),
+                &bundled_tool("ffprobe"),
+                &library_dir(),
+                &state,
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(result.quality, Some(quality));
+            assert_eq!(result.video_codec, "H264");
+            assert_eq!(result.audio_codec.as_deref(), Some("AAC"));
+            assert!(result.encoding_setting.contains("OpenH264 fixed QP"));
+            assert_eq!(result.estimated_size, Some(42_000));
+            assert!(Path::new(&result.output_path).is_file());
+            let verified = inspect_video_with_tools(
+                Path::new(&result.output_path),
+                &bundled_tool("ffprobe"),
+                &bundled_tool("ffmpeg"),
+                &library_dir(),
+            )
+            .unwrap();
+            assert!(verified.duration_seconds > 0.0 && verified.width > 0);
+            sizes.push((quality, result.compressed_size));
+        }
+
+        let silent_result = compress_with_tools(
+            target_request(&silent, &output_dir, "webm", 70),
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(silent_result.audio_codec, None);
+        assert_eq!(silent_result.video_codec, "AV1");
+
+        let mut remove_audio = target_request(&source, &output_dir, "mp4", 70);
+        remove_audio.remove_audio = true;
+        let muted = compress_with_tools(
+            remove_audio,
+            &bundled_tool("ffmpeg"),
+            &bundled_tool("ffprobe"),
+            &library_dir(),
+            &state,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(muted.audio_codec, None);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&silent).unwrap(), silent_original);
+        assert!(sizes[0].1 < sizes[1].1 && sizes[1].1 < sizes[2].1);
+        eprintln!("Target Quality MP4 sizes: {sizes:?}");
+    }
+
+    #[test]
     fn cancellation_kills_only_ffmpeg_and_removes_the_temporary_output() {
         let temp = tempfile::tempdir().unwrap();
         let output_dir = temp.path().join("outputs");
@@ -768,7 +1075,7 @@ mod tests {
 
         let worker = thread::spawn(move || {
             compress_with_tools(
-                request(&worker_source, &worker_output, "webm"),
+                target_request(&worker_source, &worker_output, "webm", 70),
                 &bundled_tool("ffmpeg"),
                 &bundled_tool("ffprobe"),
                 &library_dir(),

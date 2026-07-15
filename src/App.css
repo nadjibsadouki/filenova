@@ -952,6 +952,11 @@ button { color: inherit; }
 .video-range-control > span { display: flex; justify-content: space-between; color: #53675e; font-size: 8px; }
 .video-range-control b { color: #9a602f; }
 .video-range-control input { width: 100%; margin-top: 8px; accent-color: #a76631; }
+.video-range-control > small { display: block; margin-top: 5px; color: #71847a; font-size: 7px; }
+.video-quality-presets { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 8px; }
+.video-quality-presets button { min-height: 27px; padding: 5px 8px; border: 1px solid #dce6e0; border-radius: 7px; background: #fff; color: #52675d; font: inherit; font-size: 7px; cursor: pointer; }
+.video-quality-presets button:hover, .video-quality-presets button.active { border-color: #bd8252; background: #fff8f2; color: #8d552b; }
+.video-quality-warning { display: flex; align-items: center; gap: 5px; margin: 8px 2px 0; color: #8d6a46; font-size: 6.8px; line-height: 1.4; }
 .video-target-size > span { display: block; margin-bottom: 6px; color: #61736a; font-size: 7.5px; font-weight: 700; }
 .video-target-size > div { display: flex; overflow: hidden; border: 1px solid #dfe5e2; border-radius: 7px; background: #fff; }
 .video-target-size input { width: 100%; min-width: 0; padding: 8px; border: 0; outline: 0; color: #485b52; }
@@ -987,7 +992,7 @@ button { color: inherit; }
 .video-no-reduction { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: center; gap: 7px; padding: 8px 10px; color: #916126; background: #fff3d8; }
 .video-no-reduction strong { font-size: 8px; }
 .video-no-reduction span { font-size: 7px; }
-.video-result-metrics { display: grid; grid-template-columns: repeat(7, minmax(68px, 1fr)); gap: 0; padding: 10px; }
+.video-result-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(82px, 1fr)); gap: 0; padding: 10px; }
 .video-result-metrics > span { min-width: 0; padding: 0 8px; border-inline-end: 1px solid #dfe8e3; }
 .video-result-metrics > span:first-child { padding-inline-start: 0; }
 .video-result-metrics > span:last-child { padding-inline-end: 0; border: 0; }

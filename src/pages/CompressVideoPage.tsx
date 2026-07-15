@@ -74,6 +74,10 @@ interface VideoCompressionResult {
   outputPath: string;
   outputName: string;
   noSizeReduction: boolean;
+  quality: number | null;
+  encodingSetting: string;
+  estimatedSize: number | null;
+  estimateDifference: number | null;
 }
 
 interface VideoCompressionProgress {
@@ -130,6 +134,22 @@ function formatDuration(seconds: number) {
     : `${minutes}:${remainingSeconds}`;
 }
 
+function estimateVideoSize(size: number, quality: number, outputFormat: OutputFormat, removeAudio: boolean) {
+  const points = [[1, 0.18], [30, 0.3], [50, 0.45], [70, 0.62], [85, 0.78], [100, 0.95]] as const;
+  let ratio = points[points.length - 1][1];
+  for (let index = 1; index < points.length; index += 1) {
+    const [rightQuality, rightRatio] = points[index];
+    if (quality <= rightQuality) {
+      const [leftQuality, leftRatio] = points[index - 1];
+      const progress = (quality - leftQuality) / (rightQuality - leftQuality);
+      ratio = leftRatio + progress * (rightRatio - leftRatio);
+      break;
+    }
+  }
+  const formatFactor = outputFormat === "webm" ? 0.88 : 1;
+  return Math.max(1, Math.round(size * ratio * formatFactor * (removeAudio ? 0.92 : 1)));
+}
+
 function parseCommandError(error: unknown): { code: string; message?: string } {
   if (typeof error === "object" && error !== null) {
     const value = error as Record<string, unknown>;
@@ -156,7 +176,7 @@ export function CompressVideoPage() {
   const [items, setItems] = useState<VideoItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
   const [mode, setMode] = useState<VideoMode>("recommended");
-  const [quality, setQuality] = useState(75);
+  const [quality, setQuality] = useState(70);
   const [targetSizeMb, setTargetSizeMb] = useState(25);
   const [preserveResolution, setPreserveResolution] = useState(true);
   const [removeAudio, setRemoveAudio] = useState(false);
@@ -288,18 +308,27 @@ export function CompressVideoPage() {
   const estimatedOutputSize = useMemo(() => {
     if (!readyItems.length) return 0;
     if (mode === "targetFileSize") return targetSizeMb * 1024 * 1024 * readyItems.length;
-    const ratio = mode === "targetQuality" ? 0.25 + (quality / 100) * 0.55 : 0.58;
-    const audioFactor = removeAudio ? 0.92 : 1;
-    return Math.round(totalInputSize * ratio * audioFactor);
-  }, [mode, quality, readyItems.length, removeAudio, targetSizeMb, totalInputSize]);
+    if (mode === "targetQuality") {
+      return readyItems.reduce((total, item) => total + estimateVideoSize(item.size ?? 0, quality, outputFormat, removeAudio), 0);
+    }
+    return Math.round(totalInputSize * 0.58 * (removeAudio ? 0.92 : 1));
+  }, [mode, quality, readyItems, removeAudio, outputFormat, targetSizeMb, totalInputSize]);
+
+  const qualityDescription = quality <= 30
+    ? t("videoQualitySmaller")
+    : quality <= 60
+      ? t("videoQualityBalanced")
+      : quality <= 85
+        ? t("videoQualityHigh")
+        : t("videoQualityMaximum");
 
   function translatedError(item: VideoItem) {
     const key = item.errorCode ? videoErrorTranslations[item.errorCode] : undefined;
     return key ? t(key) : item.errorMessage || t("videoInspectionFailed");
   }
 
-  async function runRecommendedCompression() {
-    if (mode !== "recommended") {
+  async function runCompression() {
+    if (mode === "targetFileSize") {
       setPageError(t("videoModeNotImplemented"));
       return;
     }
@@ -335,6 +364,8 @@ export function CompressVideoPage() {
             removeAudio,
             preserveMetadata,
             outputFormat,
+            quality: mode === "targetQuality" ? quality : null,
+            estimatedSize: mode === "targetQuality" ? estimateVideoSize(item.size ?? 0, quality, outputFormat, removeAudio) : null,
           },
         });
         setItems((current) => current.map((entry) => entry.path === item.path ? {
@@ -467,6 +498,10 @@ export function CompressVideoPage() {
                       <span><small>{t("videoDuration")}</small><strong>{formatDuration(item.result.durationSeconds)}</strong></span>
                       <span><small>{t("finalResolution")}</small><strong>{item.result.width} × {item.result.height}</strong></span>
                       <span><small>{t("finalCodec")}</small><strong>{item.result.videoCodec}{item.result.audioCodec ? ` / ${item.result.audioCodec}` : ""}</strong></span>
+                      {item.result.quality !== null && <span><small>{t("selectedQuality")}</small><strong>{item.result.quality}%</strong></span>}
+                      <span title={item.result.encodingSetting}><small>{t("encodingSetting")}</small><strong>{item.result.encodingSetting}</strong></span>
+                      {item.result.estimatedSize !== null && <span><small>{t("estimatedSizeResult")}</small><strong>{formatBytes(item.result.estimatedSize)}</strong></span>}
+                      {item.result.estimateDifference !== null && <span><small>{t("estimateDifference")}</small><strong>{item.result.estimateDifference >= 0 ? "+" : "−"}{formatBytes(Math.abs(item.result.estimateDifference))}</strong></span>}
                     </div>
                     <div className="video-result-location"><FolderOpen size={13} /><span title={item.result.outputPath}>{item.result.outputPath}</span></div>
                     <div className="video-result-actions">
@@ -498,7 +533,13 @@ export function CompressVideoPage() {
               </button>
             ))}
           </div>
-          {mode === "targetQuality" && <label className="video-range-control"><span><strong>{t("videoQuality")}</strong><b>{quality}%</b></span><input type="range" min="10" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /></label>}
+          {mode === "targetQuality" && <div className="video-quality-controls">
+            <label className="video-range-control"><span><strong>{t("videoQuality")}</strong><b>{quality}%</b></span><input type="range" min="1" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /><small>{qualityDescription}</small></label>
+            <div className="video-quality-presets">
+              {([["videoPresetMaximumCompression", 20], ["videoPresetBalanced", 50], ["videoPresetHighQuality", 75], ["videoPresetNearOriginal", 95]] as [TranslationKey, number][]).map(([label, value]) => <button type="button" disabled={isProcessing} className={quality === value ? "active" : ""} key={label} onClick={() => setQuality(value)}>{t(label)}</button>)}
+            </div>
+            <p className="video-quality-warning"><AlertCircle size={13} />{t("videoQualityEstimateWarning")}</p>
+          </div>}
           {mode === "targetFileSize" && <label className="video-target-size"><span>{t("targetFileSizePerVideo")}</span><div><input type="number" min="1" step="1" value={targetSizeMb} onChange={(event) => setTargetSizeMb(Math.max(1, Number(event.target.value) || 1))} /><b>MB</b></div></label>}
         </section>
 
@@ -528,8 +569,8 @@ export function CompressVideoPage() {
 
       {activeProgress && <section className="video-progress-panel"><div><span>{t("videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small></section>}
       {pageError && <div className="page-error"><AlertCircle size={16} />{pageError}</div>}
-      {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelCompression()}><Ban size={19} />{t("cancelVideoCompression")}</button> : <button className="run-button video-compress-button" type="button" disabled={mode !== "recommended" || !readyItems.length} title={mode !== "recommended" ? t("videoModeNotImplemented") : undefined} onClick={() => void runRecommendedCompression()}><Clapperboard size={19} />{t("compressVideos")}</button>}
-      {mode !== "recommended" && <p className="video-disabled-hint">{t("videoModeNotImplemented")}</p>}
+      {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelCompression()}><Ban size={19} />{t("cancelVideoCompression")}</button> : <button className="run-button video-compress-button" type="button" disabled={mode === "targetFileSize" || !readyItems.length} title={mode === "targetFileSize" ? t("videoModeNotImplemented") : undefined} onClick={() => void runCompression()}><Clapperboard size={19} />{t("compressVideos")}</button>}
+      {mode === "targetFileSize" && <p className="video-disabled-hint">{t("videoModeNotImplemented")}</p>}
 
       {previewResult && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(null); }}><section className="video-preview-modal" role="dialog" aria-modal="true" aria-label={t("previewVideo")}><header><div><strong>{previewResult.outputName}</strong><small>{previewResult.width} × {previewResult.height} · {previewResult.videoCodec} · {formatDuration(previewResult.durationSeconds)}</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(null)} aria-label={t("closePreview")}><X size={17} /></button></header><video src={convertFileSrc(previewResult.outputPath)} controls autoPlay /></section></div>}
     </div>
