@@ -1,3 +1,4 @@
+mod audio_extraction;
 mod audio_extraction_plan;
 mod compression;
 mod conversion;
@@ -14,6 +15,7 @@ mod video_conversion_plan;
 mod video_target_size;
 mod video_tools;
 
+use audio_extraction::{cancel_audio_extraction, extract_audio, AudioExtractionState};
 use audio_extraction_plan::{
     get_audio_extraction_capabilities, inspect_audio_source, plan_audio_extraction,
 };
@@ -38,6 +40,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(VideoCompressionState::default())
         .manage(VideoConversionState::default())
+        .manage(AudioExtractionState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -69,7 +72,9 @@ pub fn run() {
             cancel_video_conversion,
             get_audio_extraction_capabilities,
             inspect_audio_source,
-            plan_audio_extraction
+            plan_audio_extraction,
+            extract_audio,
+            cancel_audio_extraction
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

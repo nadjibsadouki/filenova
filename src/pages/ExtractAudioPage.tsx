@@ -1,24 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   AlertCircle,
+  Ban,
   Check,
   CheckCircle2,
   FileAudio2,
   FolderOpen,
   ListMusic,
+  LoaderCircle,
   Music2,
+  Play,
   Settings2,
   Trash2,
   UploadCloud,
+  X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 
 type OutputFormat = "mp3" | "wav" | "m4a" | "flac" | "ogg";
 type Quality = "low" | "standard" | "high" | "maximum";
-type ItemStatus = "analyzing" | "ready" | "noAudio" | "failed";
+type ItemStatus = "analyzing" | "ready" | "noAudio" | "waiting" | "extracting" | "copying" | "completed" | "cancelled" | "failed";
 
 interface AudioCapabilities {
   mp3: boolean;
@@ -36,6 +42,18 @@ interface AudioSourceInfo {
   size: number;
   audioCodec: string | null;
   audioBitrate: number | null;
+  sampleRate: number | null;
+  channels: number | null;
+  audioTracks: AudioTrack[];
+}
+
+interface AudioTrack {
+  audioIndex: number;
+  streamIndex: number;
+  language: string | null;
+  title: string | null;
+  codec: string;
+  bitrate: number | null;
   sampleRate: number | null;
   channels: number | null;
 }
@@ -56,6 +74,33 @@ interface AudioItem extends Partial<AudioSourceInfo> {
   status: ItemStatus;
   errorCode?: string;
   plan?: AudioPlan;
+  selectedTrack: number;
+  result?: AudioResult;
+}
+
+interface AudioResult {
+  sourceName: string;
+  finalFormat: string;
+  finalCodec: string;
+  finalBitrate: number | null;
+  sampleRate: number | null;
+  channels: number | null;
+  selectedAudioTrack: number;
+  selectedAudioLanguage: string | null;
+  extractWithoutReencoding: boolean;
+  finalSize: number;
+  processingDurationSeconds: number;
+  outputPath: string;
+  outputName: string;
+}
+
+interface AudioProgress {
+  path: string;
+  name: string;
+  processedSeconds: number;
+  durationSeconds: number;
+  percent: number;
+  phase: "extracting" | "copying";
 }
 
 const extensions = ["mp4", "mov", "mkv", "avi", "webm", "m4v"];
@@ -67,6 +112,20 @@ const planReasons: Record<string, TranslationKey> = {
   invalid_channels: "extractAudioInvalidChannels",
   copy_codec_incompatible: "extractAudioCopyCodecIncompatible",
   copy_transform_incompatible: "extractAudioCopyTransformIncompatible",
+};
+const runErrors: Record<string, TranslationKey> = {
+  no_audio_stream: "extractAudioNoTrack",
+  audio_track_not_found: "extractAudioTrackMissing",
+  codec_unsupported: "extractAudioCodecUnsupported",
+  incompatible_audio_plan: "extractAudioCopyCodecIncompatible",
+  ffmpeg_unavailable: "ffmpegUnavailable",
+  ffprobe_unavailable: "ffprobeUnavailable",
+  destination_inaccessible: "videoDestinationInaccessible",
+  disk_full: "videoDiskFull",
+  extraction_cancelled: "extractAudioCancelledError",
+  output_empty: "videoOutputEmpty",
+  output_invalid: "videoOutputInvalid",
+  extraction_failed: "extractAudioFailedError",
 };
 
 function nameFromPath(path: string) {
@@ -122,6 +181,11 @@ export function ExtractAudioPage() {
   const [copyAudio, setCopyAudio] = useState(false);
   const [destination, setDestination] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [activeProgress, setActiveProgress] = useState<AudioProgress | null>(null);
+  const [batchPosition, setBatchPosition] = useState({ current: 0, total: 0 });
+  const [previewResult, setPreviewResult] = useState<AudioResult | null>(null);
+  const cancellationRequested = useRef(false);
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
@@ -133,7 +197,7 @@ export function ExtractAudioPage() {
   }, [capabilities]);
   const validItems = items.filter((item) => item.status === "ready");
   const copyAvailable = validItems.length > 0
-    && validItems.every((item) => copyCompatible(outputFormat, item.audioCodec));
+    && validItems.every((item) => copyCompatible(outputFormat, item.audioTracks?.[item.selectedTrack]?.codec));
   const lossyFormat = ["mp3", "m4a", "ogg"].includes(outputFormat);
   const requestedSampleRate = sampleRate === "original"
     ? null
@@ -146,7 +210,7 @@ export function ExtractAudioPage() {
       && requestedSampleRate >= 8_000
       && requestedSampleRate <= 192_000);
   const plansValid = validItems.length > 0 && validItems.every((item) => item.plan?.valid);
-  const canExtract = plansValid && sampleRateValid && outputFormats.includes(outputFormat);
+  const canExtract = plansValid && sampleRateValid && outputFormats.includes(outputFormat) && !isProcessing;
 
   useEffect(() => {
     invoke<AudioCapabilities>("get_audio_extraction_capabilities")
@@ -171,12 +235,13 @@ export function ExtractAudioPage() {
       path,
       name: nameFromPath(path),
       status: "analyzing" as const,
+      selectedTrack: 0,
     }))]);
     for (const path of selected) {
       try {
         const info = await invoke<AudioSourceInfo>("inspect_audio_source", { path });
         setItems((current) => current.map((item) => item.path === path
-          ? { ...info, status: info.audioCodec ? "ready" : "noAudio" }
+          ? { ...info, status: info.audioCodec ? "ready" : "noAudio", selectedTrack: 0 }
           : item));
       } catch (error) {
         const parsed = parseError(error);
@@ -200,14 +265,29 @@ export function ExtractAudioPage() {
 
   useEffect(() => {
     let disposed = false;
+    let cleanup: (() => void) | undefined;
+    listen<AudioProgress>("audio-extraction-progress", (event) => {
+      if (disposed) return;
+      setActiveProgress(event.payload);
+      setItems((current) => current.map((item) => item.path === event.payload.path
+        ? { ...item, status: event.payload.phase }
+        : item));
+    }).then((unlisten) => {
+      if (disposed) unlisten(); else cleanup = unlisten;
+    });
+    return () => { disposed = true; cleanup?.(); };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
     Promise.all(validItems.map(async (item) => ({
       path: item.path,
       plan: await invoke<AudioPlan>("plan_audio_extraction", {
         request: {
-          inputAudioCodec: item.audioCodec,
-          inputAudioBitrate: item.audioBitrate,
-          inputSampleRate: item.sampleRate,
-          inputChannels: item.channels,
+          inputAudioCodec: item.audioTracks?.[item.selectedTrack]?.codec ?? null,
+          inputAudioBitrate: item.audioTracks?.[item.selectedTrack]?.bitrate ?? null,
+          inputSampleRate: item.audioTracks?.[item.selectedTrack]?.sampleRate ?? null,
+          inputChannels: item.audioTracks?.[item.selectedTrack]?.channels ?? null,
           outputFormat,
           quality,
           customBitrate: lossyFormat ? bitrate : null,
@@ -223,7 +303,7 @@ export function ExtractAudioPage() {
       }));
     }).catch(() => undefined);
     return () => { disposed = true; };
-  }, [bitrate, channels, copyAudio, lossyFormat, outputFormat, quality, requestedSampleRate, sampleRateValid, validItems.map((item) => item.path).join("|")]);
+  }, [bitrate, channels, copyAudio, lossyFormat, outputFormat, quality, requestedSampleRate, sampleRateValid, validItems.map((item) => `${item.path}:${item.selectedTrack}`).join("|")]);
 
   async function chooseVideos() {
     const selected = await open({
@@ -244,6 +324,92 @@ export function ExtractAudioPage() {
     high: "extractAudioQualityHigh",
     maximum: "extractAudioQualityMaximum",
   } as const)[value]);
+  const statusLabel = (status: ItemStatus) => t(({
+    analyzing: "analyzingVideo",
+    ready: "videoReady",
+    noAudio: "extractAudioNoTrack",
+    waiting: "extractAudioWaiting",
+    extracting: "extractAudioExtracting",
+    copying: "extractAudioCopying",
+    completed: "videoCompleted",
+    cancelled: "videoCancelled",
+    failed: "videoFailed",
+  } as Record<ItemStatus, TranslationKey>)[status]);
+  const errorLabel = (item: AudioItem) => t(runErrors[item.errorCode ?? ""] ?? "videoInspectionFailed");
+
+  async function runExtraction() {
+    const queue = items.filter((item) => item.status === "ready" && item.plan?.valid);
+    if (!queue.length || !canExtract) return;
+    setIsProcessing(true);
+    setNotice(null);
+    setBatchPosition({ current: 1, total: queue.length });
+    cancellationRequested.current = false;
+    const paths = new Set(queue.map((item) => item.path));
+    setItems((current) => current.map((item) => paths.has(item.path)
+      ? { ...item, status: "waiting", errorCode: undefined }
+      : item));
+    for (let index = 0; index < queue.length; index += 1) {
+      const item = queue[index];
+      if (cancellationRequested.current) break;
+      setBatchPosition({ current: index + 1, total: queue.length });
+      const phase = item.plan?.extractWithoutReencoding ? "copying" : "extracting";
+      setActiveProgress({
+        path: item.path,
+        name: item.name,
+        processedSeconds: 0,
+        durationSeconds: item.durationSeconds ?? 0,
+        percent: 0,
+        phase,
+      });
+      setItems((current) => current.map((entry) => entry.path === item.path
+        ? { ...entry, status: phase }
+        : entry));
+      try {
+        const result = await invoke<AudioResult>("extract_audio", {
+          request: {
+            path: item.path,
+            destinationDir: destination,
+            outputFormat,
+            quality,
+            customBitrate: lossyFormat ? bitrate : null,
+            sampleRate: requestedSampleRate,
+            channels: channels === "original" ? null : Number(channels),
+            preserveMetadata,
+            copyAudioStream: copyAudio,
+            selectedAudioTrack: item.selectedTrack,
+          },
+        });
+        setItems((current) => current.map((entry) => entry.path === item.path
+          ? { ...entry, status: "completed", result }
+          : entry));
+      } catch (error) {
+        const parsed = parseError(error);
+        const cancelled = parsed.code === "extraction_cancelled";
+        setItems((current) => current.map((entry) => entry.path === item.path
+          ? { ...entry, status: cancelled ? "cancelled" : "failed", errorCode: parsed.code }
+          : entry));
+        if (cancelled || cancellationRequested.current) break;
+      }
+    }
+    if (cancellationRequested.current) {
+      setItems((current) => current.map((item) => item.status === "waiting"
+        ? { ...item, status: "cancelled", errorCode: "extraction_cancelled" }
+        : item));
+    }
+    setActiveProgress(null);
+    setIsProcessing(false);
+    cancellationRequested.current = false;
+  }
+
+  async function cancelExtraction() {
+    cancellationRequested.current = true;
+    try {
+      await invoke("cancel_audio_extraction");
+    } catch (error) {
+      const parsed = parseError(error);
+      setNotice(parsed.message || t("extractAudioCancelFailed"));
+    }
+  }
 
   return <div className="page extract-audio-page">
     <header className="page-header compression-header video-header">
@@ -251,21 +417,23 @@ export function ExtractAudioPage() {
       <div className="compress-header-actions"><label className="language-select"><span>{language.toUpperCase()}</span><select value={language} onChange={(event) => setLanguage(event.target.value as "en" | "fr" | "ar")}><option value="en">English</option><option value="fr">Français</option><option value="ar">العربية</option></select></label><div className="header-status"><Music2 size={17} /><span>FFprobe</span></div></div>
     </header>
 
-    <section className="video-drop-zone extract-audio-drop" onClick={() => void chooseVideos()}>
+    <section className={`video-drop-zone extract-audio-drop ${isProcessing ? "disabled" : ""}`} onClick={() => { if (!isProcessing) void chooseVideos(); }}>
       <div className="video-drop-icon"><UploadCloud size={34} /></div><div><h2>{t("extractAudioDropTitle")}</h2><p>{t("extractAudioDropHint")}</p></div>
-      <button className="primary-button" type="button" onClick={(event) => { event.stopPropagation(); void chooseVideos(); }}><FileAudio2 size={17} />{t("addVideos")}</button>
+      <button className="primary-button" disabled={isProcessing} type="button" onClick={(event) => { event.stopPropagation(); void chooseVideos(); }}><FileAudio2 size={17} />{t("addVideos")}</button>
     </section>
 
     <section className="compress-panel extract-audio-files">
-      <div className="compress-panel-header"><div><h2>{t("selectedVideos")}</h2><span>{t("videoCount", { count: items.length })}</span></div>{!!items.length && <button className="text-button danger" type="button" onClick={() => setItems([])}><Trash2 size={14} />{t("clearAll")}</button>}</div>
+      <div className="compress-panel-header"><div><h2>{t("selectedVideos")}</h2><span>{t("videoCount", { count: items.length })}</span></div>{!!items.length && <button className="text-button danger" disabled={isProcessing} type="button" onClick={() => setItems([])}><Trash2 size={14} />{t("clearAll")}</button>}</div>
       {!items.length ? <div className="video-empty-state"><ListMusic size={30} /><strong>{t("extractAudioEmpty")}</strong><p>{t("extractAudioEmptyHint")}</p></div> : <div className="extract-audio-list">{items.map((item) => <article className={`extract-audio-row ${item.status}`} key={item.path}>
-        <div className="extract-audio-icon"><FileAudio2 size={22} /></div><div className="extract-audio-file"><div className="video-file-title"><div><strong>{item.name}</strong><small title={item.path}>{item.path}</small></div><div className={`video-status ${item.status}`}><span>{t(item.status === "analyzing" ? "analyzingVideo" : item.status === "ready" ? "videoReady" : item.status === "noAudio" ? "extractAudioNoTrack" : "videoFailed")}</span></div></div>
-          {item.status === "failed" ? <p className="video-row-error"><AlertCircle size={14} />{t("videoInspectionFailed")}</p> : item.status === "noAudio" ? <p className="video-row-error"><AlertCircle size={14} />{t("extractAudioNoTrackExplanation")}</p> : <div className="extract-audio-metadata"><span><small>{t("format")}</small><strong>{item.format ?? "—"}</strong></span><span><small>{t("videoDuration")}</small><strong>{duration(item.durationSeconds)}</strong></span><span><small>{t("fileSize")}</small><strong>{formatBytes(item.size)}</strong></span><span><small>{t("audioCodec")}</small><strong>{item.audioCodec ?? "—"}</strong></span><span><small>{t("extractAudioBitrate")}</small><strong>{item.audioBitrate ? `${Math.round(item.audioBitrate / 1000)} kbps` : "—"}</strong></span><span><small>{t("extractAudioSampleRate")}</small><strong>{item.sampleRate ? `${(item.sampleRate / 1000).toFixed(1)} kHz` : "—"}</strong></span><span><small>{t("extractAudioChannels")}</small><strong>{item.channels ?? "—"}</strong></span></div>}
-        </div><button className="video-remove-button" type="button" onClick={() => remove(item.path)}><Trash2 size={15} /><span>{t("remove")}</span></button>
+        <div className="extract-audio-icon">{["analyzing", "waiting", "extracting", "copying"].includes(item.status) ? <LoaderCircle className="spin" size={22} /> : <FileAudio2 size={22} />}</div><div className="extract-audio-file"><div className="video-file-title"><div><strong>{item.name}</strong><small title={item.path}>{item.path}</small></div><div className={`video-status ${item.status}`}><span>{statusLabel(item.status)}</span></div></div>
+          {item.status === "failed" || item.status === "cancelled" ? <p className="video-row-error"><AlertCircle size={14} />{errorLabel(item)}</p> : item.status === "noAudio" ? <p className="video-row-error"><AlertCircle size={14} />{t("extractAudioNoTrackExplanation")}</p> : <div className="extract-audio-metadata"><span><small>{t("format")}</small><strong>{item.format ?? "—"}</strong></span><span><small>{t("videoDuration")}</small><strong>{duration(item.durationSeconds)}</strong></span><span><small>{t("fileSize")}</small><strong>{formatBytes(item.size)}</strong></span><span><small>{t("audioCodec")}</small><strong>{item.audioTracks?.[item.selectedTrack]?.codec ?? "—"}</strong></span><span><small>{t("extractAudioBitrate")}</small><strong>{item.audioTracks?.[item.selectedTrack]?.bitrate ? `${Math.round(item.audioTracks[item.selectedTrack].bitrate! / 1000)} kbps` : "—"}</strong></span><span><small>{t("extractAudioSampleRate")}</small><strong>{item.audioTracks?.[item.selectedTrack]?.sampleRate ? `${(item.audioTracks[item.selectedTrack].sampleRate! / 1000).toFixed(1)} kHz` : "—"}</strong></span><span><small>{t("extractAudioChannels")}</small><strong>{item.audioTracks?.[item.selectedTrack]?.channels ?? "—"}</strong></span></div>}
+          {!!item.audioTracks?.length && !["noAudio", "failed"].includes(item.status) && <label className="audio-track-select"><span>{t("extractAudioTrack")}</span><select disabled={isProcessing} value={item.selectedTrack} onChange={(event) => setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, selectedTrack: Number(event.target.value), plan: undefined } : entry))}>{item.audioTracks.map((track) => <option value={track.audioIndex} key={track.streamIndex}>{t("extractAudioTrackNumber", { number: track.audioIndex + 1 })} · {track.language?.toUpperCase() || t("extractAudioLanguageUnknown")} · {track.codec} · {track.channels ?? "—"} ch{track.audioIndex === 0 ? ` · ${t("extractAudioDefaultTrack")}` : ""}</option>)}</select></label>}
+          {item.result && <div className="audio-result"><div className="convert-result-mode"><CheckCircle2 size={14} />{t(item.result.extractWithoutReencoding ? "extractAudioWithoutReencoding" : "extractAudioReencoded")}</div><div className="convert-result-grid"><span><small>{t("extractAudioSourceVideo")}</small><strong>{item.result.sourceName}</strong></span><span><small>{t("extractAudioFinalFormat")}</small><strong>{item.result.finalFormat}</strong></span><span><small>{t("extractAudioPlannedCodec")}</small><strong>{item.result.finalCodec}</strong></span><span><small>{t("extractAudioBitrate")}</small><strong>{item.result.finalBitrate ? `${Math.round(item.result.finalBitrate / 1000)} kbps` : "—"}</strong></span><span><small>{t("extractAudioSampleRate")}</small><strong>{item.result.sampleRate ? `${item.result.sampleRate} Hz` : "—"}</strong></span><span><small>{t("extractAudioChannels")}</small><strong>{item.result.channels ?? "—"}</strong></span><span><small>{t("extractAudioTrack")}</small><strong>#{item.result.selectedAudioTrack} · {item.result.selectedAudioLanguage?.toUpperCase() || t("extractAudioLanguageUnknown")}</strong></span><span><small>{t("convertFinalSize")}</small><strong>{formatBytes(item.result.finalSize)}</strong></span><span><small>{t("processingDuration")}</small><strong>{duration(item.result.processingDurationSeconds)}</strong></span></div><div className="video-result-location"><FolderOpen size={13} /><span title={item.result.outputPath}>{item.result.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => setPreviewResult(item.result!)}><Play size={13} />{t("extractAudioPreview")}</button><button className="text-button" type="button" onClick={() => void openPath(item.result!.outputPath)}><FileAudio2 size={13} />{t("extractAudioOpen")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(item.result!.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></div>}
+        </div><button className="video-remove-button" disabled={isProcessing} type="button" onClick={() => remove(item.path)}><Trash2 size={15} /><span>{t("remove")}</span></button>
       </article>)}</div>}
     </section>
 
-    <div className="convert-video-settings-grid extract-audio-settings">
+    <div className={`convert-video-settings-grid extract-audio-settings ${isProcessing ? "disabled" : ""}`}>
       <section className="compress-panel convert-video-format-panel"><div className="video-section-title"><Music2 size={18} /><div><h2>{t("extractAudioOutputFormat")}</h2><p>{t("extractAudioOutputHint")}</p></div></div><div className="convert-format-options">{outputFormats.map((format) => <button type="button" className={outputFormat === format ? "active" : ""} key={format} onClick={() => setOutputFormat(format)}>{format === "m4a" ? "M4A / AAC" : format === "ogg" ? "OGG / Opus" : format.toUpperCase()}</button>)}</div>
         <label className="convert-select"><span>{t("extractAudioQuality")}</span><select value={quality} disabled={copyAudio || !lossyFormat} onChange={(event) => setQuality(event.target.value as Quality)}>{(["low", "standard", "high", "maximum"] as Quality[]).map((value) => <option key={value} value={value}>{qualityLabel(value)}</option>)}</select></label>
         <label className="convert-select"><span>{t("extractAudioCustomBitrate")}</span><select value={bitrate ?? ""} disabled={copyAudio || !lossyFormat} onChange={(event) => setBitrate(event.target.value ? Number(event.target.value) : null)}><option value="">{t("extractAudioUseQuality")}</option>{bitrates.map((value) => <option value={value} key={value}>{value} kbps</option>)}</select></label>
@@ -281,10 +449,12 @@ export function ExtractAudioPage() {
       </section>
     </div>
 
-    {!!validItems.length && <section className="compress-panel convert-plan-panel"><div className="video-section-title"><ListMusic size={18} /><div><h2>{t("extractAudioPlanTitle")}</h2><p>{t("extractAudioPlanHint")}</p></div></div><div className="convert-plan-list">{validItems.map((item) => <article className={`convert-plan ${item.plan?.valid ? "valid" : "invalid"}`} key={item.path}><header><strong>{item.name}</strong>{item.plan?.valid ? <span><CheckCircle2 size={13} />{t(item.plan.extractWithoutReencoding ? "extractAudioWithoutReencoding" : "extractAudioReencoded")}</span> : <span><AlertCircle size={13} />{t(planReasons[item.plan?.reason ?? ""] ?? "extractAudioPlanUnavailable")}</span>}</header><div><span><small>{t("extractAudioOriginalCodec")}</small><strong>{item.audioCodec}</strong></span><span><small>{t("extractAudioFinalFormat")}</small><strong>{outputFormat === "ogg" ? "OGG / Opus" : outputFormat.toUpperCase()}</strong></span><span><small>{t("extractAudioPlannedCodec")}</small><strong>{item.plan?.plannedCodec ?? "—"}</strong></span><span><small>{t("extractAudioPlannedBitrate")}</small><strong>{item.plan?.plannedBitrate ? `${Math.round(item.plan.plannedBitrate / 1000)} kbps` : t("extractAudioLossless")}</strong></span><span><small>{t("extractAudioPlannedSampleRate")}</small><strong>{item.plan?.plannedSampleRate ? `${item.plan.plannedSampleRate} Hz` : "—"}</strong></span><span><small>{t("extractAudioPlannedChannels")}</small><strong>{item.plan?.plannedChannels ?? "—"}</strong></span></div></article>)}</div></section>}
+    {!!validItems.length && <section className="compress-panel convert-plan-panel"><div className="video-section-title"><ListMusic size={18} /><div><h2>{t("extractAudioPlanTitle")}</h2><p>{t("extractAudioPlanHint")}</p></div></div><div className="convert-plan-list">{validItems.map((item) => <article className={`convert-plan ${item.plan?.valid ? "valid" : "invalid"}`} key={item.path}><header><strong>{item.name}</strong>{item.plan?.valid ? <span><CheckCircle2 size={13} />{t(item.plan.extractWithoutReencoding ? "extractAudioWithoutReencoding" : "extractAudioReencoded")}</span> : <span><AlertCircle size={13} />{t(planReasons[item.plan?.reason ?? ""] ?? "extractAudioPlanUnavailable")}</span>}</header><div><span><small>{t("extractAudioOriginalCodec")}</small><strong>{item.audioTracks?.[item.selectedTrack]?.codec ?? "—"}</strong></span><span><small>{t("extractAudioFinalFormat")}</small><strong>{outputFormat === "ogg" ? "OGG / Opus" : outputFormat.toUpperCase()}</strong></span><span><small>{t("extractAudioPlannedCodec")}</small><strong>{item.plan?.plannedCodec ?? "—"}</strong></span><span><small>{t("extractAudioPlannedBitrate")}</small><strong>{item.plan?.plannedBitrate ? `${Math.round(item.plan.plannedBitrate / 1000)} kbps` : t("extractAudioLossless")}</strong></span><span><small>{t("extractAudioPlannedSampleRate")}</small><strong>{item.plan?.plannedSampleRate ? `${item.plan.plannedSampleRate} Hz` : "—"}</strong></span><span><small>{t("extractAudioPlannedChannels")}</small><strong>{item.plan?.plannedChannels ?? "—"}</strong></span></div></article>)}</div></section>}
 
-    <section className="compress-panel video-destination-panel"><div><FolderOpen size={19} /><span><strong>{t("destinationFolder")}</strong><small title={destination ?? ""}>{destination ?? t("videoAutomaticDestination")}</small></span></div><button className="secondary-button" type="button" onClick={async () => { const selected = await open({ directory: true, multiple: false }); if (typeof selected === "string") setDestination(selected); }}>{t("chooseFolder")}</button></section>
+    <section className="compress-panel video-destination-panel"><div><FolderOpen size={19} /><span><strong>{t("destinationFolder")}</strong><small title={destination ?? ""}>{destination ?? t("videoAutomaticDestination")}</small></span></div><button className="secondary-button" disabled={isProcessing} type="button" onClick={async () => { const selected = await open({ directory: true, multiple: false }); if (typeof selected === "string") setDestination(selected); }}>{t("chooseFolder")}</button></section>
     {notice && <p className="convert-interface-notice"><CheckCircle2 size={14} />{notice}</p>}
-    <button className="run-button extract-audio-button" type="button" disabled={!canExtract} onClick={() => setNotice(t("extractAudioNotImplemented"))}><FileAudio2 size={19} />{t("extractAudioAction")}</button>
+    {activeProgress && <section className="video-progress-panel convert-progress"><div><span>{t(activeProgress.phase === "copying" ? "extractAudioCopying" : "extractAudioExtracting")}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{t("videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })} · {duration(activeProgress.processedSeconds)} / {duration(activeProgress.durationSeconds)}</small></section>}
+    {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelExtraction()}><Ban size={19} />{t("extractAudioCancel")}</button> : <button className="run-button extract-audio-button" type="button" disabled={!canExtract} onClick={() => void runExtraction()}><FileAudio2 size={19} />{t("extractAudioAction")}</button>}
+    {previewResult && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(null); }}><section className="video-preview-modal audio-preview-modal" role="dialog" aria-modal="true" aria-label={t("extractAudioPreview")}><header><div><strong>{previewResult.outputName}</strong><small>{previewResult.finalCodec} · {previewResult.sampleRate ?? "—"} Hz</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(null)}><X size={17} /></button></header><audio src={convertFileSrc(previewResult.outputPath)} controls autoPlay /></section></div>}
   </div>;
 }

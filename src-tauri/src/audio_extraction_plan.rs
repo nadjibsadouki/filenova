@@ -10,31 +10,45 @@ const ACCEPTED_VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mov", "mkv", "avi", "webm"
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioExtractionCapabilities {
-    mp3: bool,
-    wav: bool,
-    m4a: bool,
-    flac: bool,
-    ogg_opus: bool,
+    pub(crate) mp3: bool,
+    pub(crate) wav: bool,
+    pub(crate) m4a: bool,
+    pub(crate) flac: bool,
+    pub(crate) ogg_opus: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioSourceInfo {
-    path: String,
-    name: String,
-    format: String,
-    duration_seconds: f64,
-    size: u64,
-    audio_codec: Option<String>,
-    audio_bitrate: Option<u64>,
-    sample_rate: Option<u64>,
-    channels: Option<u64>,
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) format: String,
+    pub(crate) duration_seconds: f64,
+    pub(crate) size: u64,
+    pub(crate) audio_codec: Option<String>,
+    pub(crate) audio_bitrate: Option<u64>,
+    pub(crate) sample_rate: Option<u64>,
+    pub(crate) channels: Option<u64>,
+    pub(crate) audio_tracks: Vec<AudioTrackInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioTrackInfo {
+    pub(crate) audio_index: usize,
+    pub(crate) stream_index: u64,
+    pub(crate) language: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) codec: String,
+    pub(crate) bitrate: Option<u64>,
+    pub(crate) sample_rate: Option<u64>,
+    pub(crate) channels: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AudioExtractionError {
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl AudioExtractionError {
@@ -49,28 +63,28 @@ impl AudioExtractionError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioExtractionPlanRequest {
-    input_audio_codec: Option<String>,
-    input_audio_bitrate: Option<u64>,
-    input_sample_rate: Option<u64>,
-    input_channels: Option<u64>,
-    output_format: String,
-    quality: String,
-    custom_bitrate: Option<u64>,
-    sample_rate: Option<u64>,
-    channels: Option<u64>,
-    copy_audio_stream: bool,
+    pub(crate) input_audio_codec: Option<String>,
+    pub(crate) input_audio_bitrate: Option<u64>,
+    pub(crate) input_sample_rate: Option<u64>,
+    pub(crate) input_channels: Option<u64>,
+    pub(crate) output_format: String,
+    pub(crate) quality: String,
+    pub(crate) custom_bitrate: Option<u64>,
+    pub(crate) sample_rate: Option<u64>,
+    pub(crate) channels: Option<u64>,
+    pub(crate) copy_audio_stream: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioExtractionPlan {
-    valid: bool,
-    reason: Option<String>,
-    planned_codec: Option<String>,
-    planned_bitrate: Option<u64>,
-    planned_sample_rate: Option<u64>,
-    planned_channels: Option<u64>,
-    extract_without_reencoding: bool,
+    pub(crate) valid: bool,
+    pub(crate) reason: Option<String>,
+    pub(crate) planned_codec: Option<String>,
+    pub(crate) planned_bitrate: Option<u64>,
+    pub(crate) planned_sample_rate: Option<u64>,
+    pub(crate) planned_channels: Option<u64>,
+    pub(crate) extract_without_reencoding: bool,
 }
 
 fn query_capabilities(
@@ -106,7 +120,7 @@ fn query_capabilities(
     })
 }
 
-fn detect_capabilities(
+pub(crate) fn detect_capabilities(
     ffmpeg: &Path,
     library_dir: &Path,
 ) -> Result<AudioExtractionCapabilities, String> {
@@ -139,7 +153,7 @@ pub async fn inspect_audio_source(
     .map_err(|error| AudioExtractionError::new("inspection_failed", error.to_string()))?
 }
 
-fn inspect_audio_source_with_tool(
+pub(crate) fn inspect_audio_source_with_tool(
     path: &Path,
     ffprobe: &Path,
     library_dir: &Path,
@@ -204,18 +218,33 @@ fn inspect_audio_source_with_tool(
             "The selected file contains no video stream.",
         ));
     }
-    let audio = streams
-        .iter()
-        .find(|stream| stream["codec_type"].as_str() == Some("audio"));
     let parse_u64 = |value: &serde_json::Value| {
         value
             .as_str()
             .and_then(|value| value.parse::<u64>().ok())
             .or_else(|| value.as_u64())
     };
+    let audio_tracks = streams
+        .iter()
+        .filter(|stream| stream["codec_type"].as_str() == Some("audio"))
+        .enumerate()
+        .map(|(audio_index, stream)| AudioTrackInfo {
+            audio_index,
+            stream_index: stream["index"].as_u64().unwrap_or(audio_index as u64),
+            language: stream["tags"]["language"].as_str().map(str::to_owned),
+            title: stream["tags"]["title"].as_str().map(str::to_owned),
+            codec: stream["codec_name"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_ascii_uppercase(),
+            bitrate: parse_u64(&stream["bit_rate"]),
+            sample_rate: parse_u64(&stream["sample_rate"]),
+            channels: parse_u64(&stream["channels"]),
+        })
+        .collect::<Vec<_>>();
+    let audio = audio_tracks.first();
     let duration_seconds = document["format"]["duration"]
         .as_str()
-        .or_else(|| audio.and_then(|stream| stream["duration"].as_str()))
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(0.0);
@@ -233,12 +262,11 @@ fn inspect_audio_source_with_tool(
         },
         duration_seconds,
         size: metadata.len(),
-        audio_codec: audio
-            .and_then(|stream| stream["codec_name"].as_str())
-            .map(str::to_ascii_uppercase),
-        audio_bitrate: audio.and_then(|stream| parse_u64(&stream["bit_rate"])),
-        sample_rate: audio.and_then(|stream| parse_u64(&stream["sample_rate"])),
-        channels: audio.and_then(|stream| parse_u64(&stream["channels"])),
+        audio_codec: audio.map(|track| track.codec.clone()),
+        audio_bitrate: audio.and_then(|track| track.bitrate),
+        sample_rate: audio.and_then(|track| track.sample_rate),
+        channels: audio.and_then(|track| track.channels),
+        audio_tracks,
     })
 }
 
@@ -502,5 +530,20 @@ mod tests {
             build_audio_extraction_plan(&silent).reason.as_deref(),
             Some("no_audio_stream")
         );
+        let expected = [
+            ("low", 96_000),
+            ("standard", 128_000),
+            ("high", 192_000),
+            ("maximum", 320_000),
+        ];
+        for (quality, bitrate) in expected {
+            let mut value = request("mp3", false);
+            value.quality = quality.into();
+            value.custom_bitrate = None;
+            assert_eq!(
+                build_audio_extraction_plan(&value).planned_bitrate,
+                Some(bitrate)
+            );
+        }
     }
 }
