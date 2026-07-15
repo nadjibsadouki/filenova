@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   AlertCircle,
+  Ban,
   Check,
   CheckCircle2,
   CircleGauge,
@@ -13,16 +16,18 @@ import {
   HardDrive,
   ImageOff,
   LoaderCircle,
+  Play,
   Settings2,
   Trash2,
   UploadCloud,
   Video,
   VolumeX,
+  X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 
 type VideoMode = "recommended" | "targetQuality" | "targetFileSize";
-type VideoStatus = "analyzing" | "ready" | "failed";
+type VideoStatus = "analyzing" | "ready" | "processing" | "completed" | "cancelled" | "failed";
 type OutputFormat = "mp4" | "webm";
 
 interface VideoInfo {
@@ -52,6 +57,31 @@ interface VideoItem {
   thumbnailUrl?: string;
   errorCode?: string;
   errorMessage?: string;
+  result?: VideoCompressionResult;
+  resultKept?: boolean;
+}
+
+interface VideoCompressionResult {
+  originalSize: number;
+  compressedSize: number;
+  savedBytes: number;
+  reductionPercent: number;
+  durationSeconds: number;
+  width: number;
+  height: number;
+  videoCodec: string;
+  audioCodec: string | null;
+  outputPath: string;
+  outputName: string;
+  noSizeReduction: boolean;
+}
+
+interface VideoCompressionProgress {
+  path: string;
+  name: string;
+  processedSeconds: number;
+  durationSeconds: number;
+  percent: number;
 }
 
 const videoErrorTranslations: Record<string, TranslationKey> = {
@@ -63,6 +93,18 @@ const videoErrorTranslations: Record<string, TranslationKey> = {
   ffprobe_unavailable: "ffprobeUnavailable",
   ffmpeg_unavailable: "ffmpegUnavailable",
   inspection_failed: "videoInspectionFailed",
+  compression_busy: "videoCompressionBusy",
+  compression_cancelled: "videoCompressionCancelled",
+  cancel_failed: "videoCancelFailed",
+  unsupported_codec: "videoUnsupportedCodec",
+  destination_inaccessible: "videoDestinationInaccessible",
+  disk_full: "videoDiskFull",
+  encoding_failed: "videoEncodingFailed",
+  output_empty: "videoOutputEmpty",
+  output_invalid: "videoOutputInvalid",
+  invalid_output_format: "videoInvalidOutputFormat",
+  mode_not_implemented: "videoModeNotImplemented",
+  delete_failed: "videoDeleteFailed",
 };
 
 function fileNameFromPath(path: string) {
@@ -120,7 +162,13 @@ export function CompressVideoPage() {
   const [removeAudio, setRemoveAudio] = useState(false);
   const [preserveMetadata, setPreserveMetadata] = useState(true);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp4");
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [activeProgress, setActiveProgress] = useState<VideoCompressionProgress | null>(null);
+  const [batchPosition, setBatchPosition] = useState({ current: 0, total: 0 });
+  const [previewResult, setPreviewResult] = useState<VideoCompressionResult | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
   const thumbnailUrls = useRef(new Set<string>());
+  const cancellationRequested = useRef(false);
 
   const addPaths = useCallback(async (paths: string[]) => {
     const unique = [...new Set(paths)].filter((path) => !items.some((item) => item.path === path));
@@ -184,7 +232,22 @@ export function CompressVideoPage() {
     thumbnailUrls.current.clear();
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<VideoCompressionProgress>("video-compression-progress", (event) => {
+      if (!disposed) setActiveProgress(event.payload);
+    }).then((cleanup) => {
+      if (disposed) cleanup(); else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   async function chooseVideos() {
+    if (isProcessing) return;
     const selected = await open({
       multiple: true,
       directory: false,
@@ -194,11 +257,13 @@ export function CompressVideoPage() {
   }
 
   async function chooseDestination() {
+    if (isProcessing) return;
     const selected = await open({ directory: true, multiple: false });
     if (typeof selected === "string") setDestination(selected);
   }
 
   function removeItem(path: string) {
+    if (isProcessing) return;
     setItems((current) => {
       const removed = current.find((item) => item.path === path);
       if (removed?.thumbnailUrl) {
@@ -210,6 +275,7 @@ export function CompressVideoPage() {
   }
 
   function clearAll() {
+    if (isProcessing) return;
     items.forEach((item) => {
       if (item.thumbnailUrl) URL.revokeObjectURL(item.thumbnailUrl);
     });
@@ -230,6 +296,95 @@ export function CompressVideoPage() {
   function translatedError(item: VideoItem) {
     const key = item.errorCode ? videoErrorTranslations[item.errorCode] : undefined;
     return key ? t(key) : item.errorMessage || t("videoInspectionFailed");
+  }
+
+  async function runRecommendedCompression() {
+    if (mode !== "recommended") {
+      setPageError(t("videoModeNotImplemented"));
+      return;
+    }
+    const queue = items.filter((item) => item.status === "ready");
+    if (!queue.length || isProcessing) return;
+
+    setIsProcessing(true);
+    setPageError(null);
+    setBatchPosition({ current: 1, total: queue.length });
+    cancellationRequested.current = false;
+
+    for (let index = 0; index < queue.length; index += 1) {
+      const item = queue[index];
+      if (cancellationRequested.current) break;
+      setBatchPosition({ current: index + 1, total: queue.length });
+      setActiveProgress({ path: item.path, name: item.name, processedSeconds: 0, durationSeconds: item.durationSeconds ?? 0, percent: 0 });
+      setItems((current) => current.map((entry) => entry.path === item.path ? {
+        ...entry,
+        status: "processing",
+        errorCode: undefined,
+        errorMessage: undefined,
+        result: undefined,
+        resultKept: false,
+      } : entry));
+
+      try {
+        const result = await invoke<VideoCompressionResult>("compress_recommended_video", {
+          request: {
+            path: item.path,
+            destinationDir: destination,
+            mode,
+            preserveResolution,
+            removeAudio,
+            preserveMetadata,
+            outputFormat,
+          },
+        });
+        setItems((current) => current.map((entry) => entry.path === item.path ? {
+          ...entry,
+          status: "completed",
+          result,
+        } : entry));
+      } catch (error) {
+        const parsed = parseCommandError(error);
+        const cancelled = parsed.code === "compression_cancelled";
+        setItems((current) => current.map((entry) => entry.path === item.path ? {
+          ...entry,
+          status: cancelled ? "cancelled" : "failed",
+          errorCode: parsed.code,
+          errorMessage: parsed.message,
+        } : entry));
+        if (cancelled || cancellationRequested.current) break;
+      }
+    }
+
+    setIsProcessing(false);
+    setActiveProgress(null);
+    cancellationRequested.current = false;
+  }
+
+  async function cancelCompression() {
+    cancellationRequested.current = true;
+    try {
+      await invoke<boolean>("cancel_video_compression");
+    } catch (error) {
+      const parsed = parseCommandError(error);
+      setPageError(parsed.message || t(videoErrorTranslations[parsed.code] ?? "videoCancelFailed"));
+    }
+  }
+
+  async function deleteResult(item: VideoItem) {
+    if (!item.result || isProcessing) return;
+    try {
+      await invoke("delete_video_result", { path: item.result.outputPath });
+      if (previewResult?.outputPath === item.result.outputPath) setPreviewResult(null);
+      setItems((current) => current.map((entry) => entry.path === item.path ? {
+        ...entry,
+        status: "ready",
+        result: undefined,
+        resultKept: false,
+      } : entry));
+    } catch (error) {
+      const parsed = parseCommandError(error);
+      setPageError(parsed.message || t(videoErrorTranslations[parsed.code] ?? "videoDeleteFailed"));
+    }
   }
 
   return (
@@ -253,13 +408,13 @@ export function CompressVideoPage() {
         </div>
       </header>
 
-      <section className="video-drop-zone" onClick={() => void chooseVideos()}>
+      <section className={`video-drop-zone ${isProcessing ? "disabled" : ""}`} onClick={() => void chooseVideos()}>
         <div className="video-drop-icon"><UploadCloud size={34} /></div>
         <div>
           <h2>{t("videoDropTitle")}</h2>
           <p>{t("videoDropSubtitle")}</p>
         </div>
-        <button className="primary-button" type="button" onClick={(event) => { event.stopPropagation(); void chooseVideos(); }}>
+        <button className="primary-button" type="button" disabled={isProcessing} onClick={(event) => { event.stopPropagation(); void chooseVideos(); }}>
           <FileVideo2 size={17} />{t("addVideos")}
         </button>
       </section>
@@ -267,7 +422,7 @@ export function CompressVideoPage() {
       <section className="compress-panel video-files-panel">
         <div className="compress-panel-header">
           <div><h2>{t("selectedVideos")}</h2><span>{t("videoCount", { count: items.length })}</span></div>
-          {!!items.length && <button className="text-button danger" type="button" onClick={clearAll}><Trash2 size={14} />{t("clearAll")}</button>}
+          {!!items.length && <button className="text-button danger" type="button" disabled={isProcessing} onClick={clearAll}><Trash2 size={14} />{t("clearAll")}</button>}
         </div>
 
         {!items.length ? (
@@ -285,12 +440,12 @@ export function CompressVideoPage() {
                   <div className="video-file-title">
                     <div><strong title={item.path}>{item.name}</strong><small title={item.path}>{item.path}</small></div>
                     <div className={`video-status ${item.status}`}>
-                      {item.status === "analyzing" ? <LoaderCircle className="spin" size={13} /> : item.status === "ready" ? <CheckCircle2 size={13} /> : <AlertCircle size={13} />}
-                      <span>{t(item.status === "analyzing" ? "analyzingVideo" : item.status === "ready" ? "videoReady" : "videoFailed")}</span>
+                      {item.status === "analyzing" || item.status === "processing" ? <LoaderCircle className="spin" size={13} /> : item.status === "ready" || item.status === "completed" ? <CheckCircle2 size={13} /> : item.status === "cancelled" ? <Ban size={13} /> : <AlertCircle size={13} />}
+                      <span>{t(item.status === "analyzing" ? "analyzingVideo" : item.status === "processing" ? "videoCompressing" : item.status === "ready" ? "videoReady" : item.status === "completed" ? "videoCompleted" : item.status === "cancelled" ? "videoCancelled" : "videoFailed")}</span>
                     </div>
                   </div>
 
-                  {item.status === "failed" ? (
+                  {item.status === "failed" || item.status === "cancelled" ? (
                     <div className="video-row-error"><AlertCircle size={14} /><span>{translatedError(item)}</span></div>
                   ) : (
                     <div className="video-metadata-grid">
@@ -302,9 +457,29 @@ export function CompressVideoPage() {
                       <span><small>{t("audioCodec")}</small><strong className="technical-value">{item.audioCodec ?? (item.status === "ready" ? t("noAudio") : "—")}</strong></span>
                     </div>
                   )}
+                  {item.result && <div className={`video-result-strip ${item.result.noSizeReduction ? "no-reduction" : ""}`}>
+                    {item.result.noSizeReduction && <div className="video-no-reduction"><AlertCircle size={15} /><strong>{t("noSizeReduction")}</strong><span>{t("noSizeReductionHint")}</span></div>}
+                    <div className="video-result-metrics">
+                      <span><small>{t("originalSize")}</small><strong>{formatBytes(item.result.originalSize)}</strong></span>
+                      <span><small>{t("compressedSize")}</small><strong>{formatBytes(item.result.compressedSize)}</strong></span>
+                      <span><small>{t("spaceSaved")}</small><strong>{formatBytes(item.result.savedBytes)}</strong></span>
+                      <span><small>{t("reduction")}</small><strong>{item.result.reductionPercent.toFixed(1)}%</strong></span>
+                      <span><small>{t("videoDuration")}</small><strong>{formatDuration(item.result.durationSeconds)}</strong></span>
+                      <span><small>{t("finalResolution")}</small><strong>{item.result.width} × {item.result.height}</strong></span>
+                      <span><small>{t("finalCodec")}</small><strong>{item.result.videoCodec}{item.result.audioCodec ? ` / ${item.result.audioCodec}` : ""}</strong></span>
+                    </div>
+                    <div className="video-result-location"><FolderOpen size={13} /><span title={item.result.outputPath}>{item.result.outputPath}</span></div>
+                    <div className="video-result-actions">
+                      <button className="text-button" type="button" onClick={() => setPreviewResult(item.result!)}><Play size={13} />{t("previewVideo")}</button>
+                      <button className="text-button" type="button" onClick={() => void openPath(item.result!.outputPath)}><Video size={13} />{t("openVideo")}</button>
+                      <button className="text-button" type="button" onClick={() => void revealItemInDir(item.result!.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button>
+                      {item.result.noSizeReduction && !item.resultKept && <><button className="text-button danger" type="button" onClick={() => void deleteResult(item)}><Trash2 size={13} />{t("deleteResult")}</button><button className="text-button" type="button" onClick={() => setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, resultKept: true } : entry))}><Check size={13} />{t("keepResult")}</button></>}
+                      {item.resultKept && <span className="video-result-kept"><Check size={13} />{t("resultKept")}</span>}
+                    </div>
+                  </div>}
                 </div>
 
-                <button className="video-remove-button" type="button" onClick={() => removeItem(item.path)} title={t("remove")}>
+                <button className="video-remove-button" type="button" disabled={isProcessing} onClick={() => removeItem(item.path)} title={t("remove")}>
                   <Trash2 size={15} /><span>{t("remove")}</span>
                 </button>
               </article>
@@ -318,7 +493,7 @@ export function CompressVideoPage() {
           <div className="video-section-title"><CircleGauge size={18} /><div><h2>{t("videoCompressionMode")}</h2><p>{t("videoCompressionModeHint")}</p></div></div>
           <div className="video-mode-options">
             {(["recommended", "targetQuality", "targetFileSize"] as VideoMode[]).map((value) => (
-              <button type="button" className={mode === value ? "active" : ""} key={value} onClick={() => setMode(value)}>
+              <button type="button" disabled={isProcessing} className={mode === value ? "active" : ""} key={value} onClick={() => setMode(value)}>
                 <span className="radio-dot" /><span><strong>{t(`video${value[0].toUpperCase()}${value.slice(1)}` as TranslationKey)}</strong><small>{t(`video${value[0].toUpperCase()}${value.slice(1)}Hint` as TranslationKey)}</small></span>
               </button>
             ))}
@@ -330,20 +505,20 @@ export function CompressVideoPage() {
         <section className="compress-panel video-options-panel">
           <div className="video-section-title"><Settings2 size={18} /><div><h2>{t("videoOptions")}</h2><p>{t("videoOptionsHint")}</p></div></div>
           <div className="video-check-options">
-            <label><input type="checkbox" checked={preserveResolution} onChange={(event) => setPreserveResolution(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("preserveResolution")}</strong><small>{t("preserveResolutionHint")}</small></span></label>
-            <label><input type="checkbox" checked={removeAudio} onChange={(event) => setRemoveAudio(event.target.checked)} /><span className="custom-check"><VolumeX size={13} /></span><span><strong>{t("removeAudio")}</strong><small>{t("removeAudioHint")}</small></span></label>
-            <label><input type="checkbox" checked={preserveMetadata} onChange={(event) => setPreserveMetadata(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("preserveMetadata")}</strong><small>{t("preserveMetadataHint")}</small></span></label>
+            <label><input type="checkbox" disabled={isProcessing} checked={preserveResolution} onChange={(event) => setPreserveResolution(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("preserveResolution")}</strong><small>{t("preserveResolutionHint")}</small></span></label>
+            <label><input type="checkbox" disabled={isProcessing} checked={removeAudio} onChange={(event) => setRemoveAudio(event.target.checked)} /><span className="custom-check"><VolumeX size={13} /></span><span><strong>{t("removeAudio")}</strong><small>{t("removeAudioHint")}</small></span></label>
+            <label><input type="checkbox" disabled={isProcessing} checked={preserveMetadata} onChange={(event) => setPreserveMetadata(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><span><strong>{t("preserveMetadata")}</strong><small>{t("preserveMetadataHint")}</small></span></label>
           </div>
           <div className="video-output-format">
             <strong>{t("outputFormat")}</strong>
-            <div>{(["mp4", "webm"] as OutputFormat[]).map((value) => <button type="button" className={outputFormat === value ? "active" : ""} onClick={() => setOutputFormat(value)} key={value}>{value === "mp4" ? "MP4" : "WebM"}</button>)}</div>
+            <div>{(["mp4", "webm"] as OutputFormat[]).map((value) => <button type="button" disabled={isProcessing} className={outputFormat === value ? "active" : ""} onClick={() => setOutputFormat(value)} key={value}>{value === "mp4" ? "MP4" : "WebM"}</button>)}</div>
           </div>
         </section>
       </div>
 
       <section className="compress-panel video-destination-panel">
         <div className="video-section-title"><HardDrive size={18} /><div><h2>{t("destination")}</h2><p className="technical-path">{destination ?? t("videoAutomaticDestination")}</p></div></div>
-        <button className="secondary-button" type="button" onClick={() => void chooseDestination()}><FolderOpen size={15} />{t("chooseFolder")}</button>
+        <button className="secondary-button" type="button" disabled={isProcessing} onClick={() => void chooseDestination()}><FolderOpen size={15} />{t("chooseFolder")}</button>
       </section>
 
       <section className="video-estimate-panel">
@@ -351,10 +526,12 @@ export function CompressVideoPage() {
         <div><span>{t("totalInputSize")}</span><strong>{totalInputSize ? formatBytes(totalInputSize) : "—"}</strong><small>{t("videoFilesReady", { count: readyItems.length })}</small></div>
       </section>
 
-      <button className="run-button video-compress-button" type="button" disabled title={t("videoCompressionNotAvailable")}>
-        <Clapperboard size={19} />{t("compressVideos")}
-      </button>
-      <p className="video-disabled-hint">{t("videoCompressionNotAvailable")}</p>
+      {activeProgress && <section className="video-progress-panel"><div><span>{t("videoProcessingFile", { current: batchPosition.current, total: batchPosition.total })}</span><strong>{activeProgress.name}</strong><b>{activeProgress.percent.toFixed(1)}%</b></div><progress max="100" value={activeProgress.percent} /><small>{formatDuration(activeProgress.processedSeconds)} / {formatDuration(activeProgress.durationSeconds)}</small></section>}
+      {pageError && <div className="page-error"><AlertCircle size={16} />{pageError}</div>}
+      {isProcessing ? <button className="run-button video-cancel-button" type="button" onClick={() => void cancelCompression()}><Ban size={19} />{t("cancelVideoCompression")}</button> : <button className="run-button video-compress-button" type="button" disabled={mode !== "recommended" || !readyItems.length} title={mode !== "recommended" ? t("videoModeNotImplemented") : undefined} onClick={() => void runRecommendedCompression()}><Clapperboard size={19} />{t("compressVideos")}</button>}
+      {mode !== "recommended" && <p className="video-disabled-hint">{t("videoModeNotImplemented")}</p>}
+
+      {previewResult && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(null); }}><section className="video-preview-modal" role="dialog" aria-modal="true" aria-label={t("previewVideo")}><header><div><strong>{previewResult.outputName}</strong><small>{previewResult.width} × {previewResult.height} · {previewResult.videoCodec} · {formatDuration(previewResult.durationSeconds)}</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(null)} aria-label={t("closePreview")}><X size={17} /></button></header><video src={convertFileSrc(previewResult.outputPath)} controls autoPlay /></section></div>}
     </div>
   );
 }

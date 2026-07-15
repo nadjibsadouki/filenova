@@ -9,28 +9,28 @@ use std::{
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
-const TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
+pub(crate) const TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
 const ACCEPTED_VIDEO_EXTENSIONS: [&str; 6] = ["mp4", "mov", "mkv", "avi", "webm", "m4v"];
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoInfo {
-    path: String,
-    name: String,
-    format: String,
-    duration_seconds: f64,
-    width: u64,
-    height: u64,
-    size: u64,
-    video_codec: String,
-    audio_codec: Option<String>,
-    thumbnail_data: Option<Vec<u8>>,
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) format: String,
+    pub(crate) duration_seconds: f64,
+    pub(crate) width: u64,
+    pub(crate) height: u64,
+    pub(crate) size: u64,
+    pub(crate) video_codec: String,
+    pub(crate) audio_codec: Option<String>,
+    pub(crate) thumbnail_data: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct VideoInspectError {
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl VideoInspectError {
@@ -59,7 +59,7 @@ pub fn log_tool_versions(app: &AppHandle) {
     }
 }
 
-fn runtime_library_dir(app: &AppHandle) -> PathBuf {
+pub(crate) fn runtime_library_dir(app: &AppHandle) -> PathBuf {
     if cfg!(debug_assertions) {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/ffmpeg")
     } else {
@@ -70,7 +70,7 @@ fn runtime_library_dir(app: &AppHandle) -> PathBuf {
     }
 }
 
-fn find_sidecar(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+pub(crate) fn find_sidecar(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     let suffixed = format!("{name}-{TARGET_TRIPLE}.exe");
     let plain = format!("{name}.exe");
     let mut candidates = Vec::new();
@@ -123,7 +123,7 @@ fn version_line(binary: &Path, library_dir: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("{} returned no version", binary.display()))
 }
 
-fn path_with_runtime_libraries(library_dir: &Path) -> OsString {
+pub(crate) fn path_with_runtime_libraries(library_dir: &Path) -> OsString {
     let existing = env::var_os("PATH").unwrap_or_default();
     let mut paths = vec![library_dir.to_path_buf()];
     paths.extend(env::split_paths(&existing));
@@ -145,7 +145,7 @@ pub async fn inspect_video(app: AppHandle, path: String) -> Result<VideoInfo, Vi
     .map_err(|error| VideoInspectError::new("inspection_failed", error.to_string()))?
 }
 
-fn inspect_video_with_tools(
+pub(crate) fn inspect_video_with_tools(
     path: &Path,
     ffprobe: &Path,
     ffmpeg: &Path,

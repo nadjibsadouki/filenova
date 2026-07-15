@@ -6,6 +6,7 @@ mod pdf_organize;
 mod pdf_split;
 mod pdf_to_images;
 mod resizing;
+mod video_compression;
 mod video_tools;
 
 use compression::{compress_image, inspect_image};
@@ -16,11 +17,16 @@ use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
 use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_output};
 use resizing::resize_image;
+use video_compression::{
+    cancel_video_compression, compress_recommended_video, delete_video_result,
+    VideoCompressionState,
+};
 use video_tools::inspect_video;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(VideoCompressionState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -41,7 +47,10 @@ pub fn run() {
             inspect_pdf_for_images,
             pdf_to_images,
             validate_pdf_image_output,
-            inspect_video
+            inspect_video,
+            compress_recommended_video,
+            cancel_video_compression,
+            delete_video_result
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");
