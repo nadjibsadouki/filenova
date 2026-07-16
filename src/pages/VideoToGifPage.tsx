@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openPath as openSystemPath, revealItemInDir as revealSystemItem } from "@tauri-apps/plugin-opener";
 import {
   AlertCircle,
+  Ban,
   Check,
+  CheckCircle2,
   Clock3,
   FileVideo2,
   Film,
@@ -15,6 +19,7 @@ import {
   Settings2,
   Trash2,
   UploadCloud,
+  X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 import {
@@ -40,6 +45,33 @@ interface VideoInfo {
   videoCodec: string;
 }
 
+interface GifResult {
+  outputPath: string;
+  outputName: string;
+  startSeconds: number;
+  endSeconds: number;
+  durationSeconds: number;
+  width: number;
+  height: number;
+  framesPerSecond: number;
+  finalSize: number;
+  processingDurationSeconds: number;
+  profile: GifQuality;
+  optimizeColors: boolean;
+  dithering: GifDithering;
+  playCount: number | null;
+  frameCount: number;
+  estimatedSize: number;
+}
+
+interface GifProgress {
+  phase: "palette" | "gif";
+  phasePercent: number;
+  overallPercent: number;
+  processedSeconds: number;
+  durationSeconds: number;
+}
+
 type FrameRateOption = "5" | "10" | "15" | "20" | "24" | "30" | "custom";
 type LoopOption = "infinite" | "1" | "2" | "3" | "custom";
 const extensions = ["mp4", "mov", "mkv", "avi", "webm", "m4v"];
@@ -52,7 +84,26 @@ function formatBytes(bytes: number) {
 }
 
 function defaultGifName(name: string) {
-  return `${name.replace(/\.[^.]+$/, "") || "video"}.gif`;
+  return `${name.replace(/\.[^.]+$/, "") || "video"}-animation.gif`;
+}
+
+function errorMessage(reason: unknown) {
+  if (reason && typeof reason === "object" && "message" in reason) return String(reason.message);
+  return String(reason);
+}
+
+function gifErrorKey(reason: unknown): TranslationKey | null {
+  const code = reason && typeof reason === "object" && "code" in reason ? String(reason.code) : "";
+  const keys: Record<string, TranslationKey> = {
+    invalid_time: "gifInvalidTime", negative_start: "gifStartNegative", start_after_end: "gifStartBeforeEnd",
+    end_after_duration: "gifEndAfterDuration", selection_too_short: "gifSelectionTooShort", selection_too_long: "gifSelectionTooLong",
+    invalid_dimensions: "gifInvalidDimensions", invalid_frame_rate: "gifInvalidFrameRate", invalid_loop: "gifInvalidLoop",
+    ffmpeg_unavailable: "gifFfmpegUnavailable", ffprobe_unavailable: "gifFfprobeUnavailable",
+    palette_generation_failed: "gifPaletteFailed", gif_creation_failed: "gifEncodingFailed",
+    destination_inaccessible: "gifDestinationFailed", disk_full: "gifDiskFull", gif_cancelled: "gifCancelled",
+    output_invalid: "gifOutputInvalid", gif_busy: "gifBusy", cancel_failed: "gifCancelFailed",
+  };
+  return keys[code] ?? null;
 }
 
 export function VideoToGifPage() {
@@ -78,6 +129,11 @@ export function VideoToGifPage() {
   const [dithering, setDithering] = useState<GifDithering>("bayer");
   const [destination, setDestination] = useState<string | null>(null);
   const [outputName, setOutputName] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
+  const [creationError, setCreationError] = useState("");
+  const [result, setResult] = useState<GifResult | null>(null);
+  const [progress, setProgress] = useState<GifProgress | null>(null);
+  const [previewResult, setPreviewResult] = useState(false);
   const player = useRef<HTMLVideoElement>(null);
   const previewing = useRef(false);
 
@@ -98,6 +154,8 @@ export function VideoToGifPage() {
       setEndInput(formatGifTime(initialEnd));
       setCurrentTime(0);
       setOutputName(defaultGifName(info.name));
+      setResult(null);
+      setCreationError("");
       setStatus("ready");
     } catch (reason) {
       setVideo(null);
@@ -116,6 +174,17 @@ export function VideoToGifPage() {
     });
     return () => { disposed = true; cleanup?.(); };
   }, [loadVideo]);
+
+  useEffect(() => {
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    listen<GifProgress>("video-gif-progress", (event) => {
+      if (!disposed) setProgress(event.payload);
+    }).then((unlisten) => {
+      if (disposed) unlisten(); else cleanup = unlisten;
+    });
+    return () => { disposed = true; cleanup?.(); };
+  }, []);
 
   const selectedDuration = Math.max(0, end - start);
   const selectionError = useMemo<TranslationKey | null>(() => {
@@ -138,6 +207,7 @@ export function VideoToGifPage() {
   const dimensionInvalid = dimensions.width < 2 || dimensions.height < 2 || (dimension === "custom" && (!Number.isFinite(customWidth) || customWidth <= 0));
   const frameRateInvalid = !Number.isFinite(selectedFrameRate) || selectedFrameRate <= 0 || selectedFrameRate > 120;
   const loopInvalid = loop === "custom" && (!Number.isInteger(customLoop) || customLoop <= 0 || customLoop > 10_000);
+  const selectedPlayCount = loop === "infinite" ? null : loop === "custom" ? customLoop : Number(loop);
   const nameInvalid = !outputName.trim() || outputName.includes("/") || outputName.includes("\\");
   const validPlan = !selectionError && !dimensionInvalid && !frameRateInvalid && !loopInvalid && !nameInvalid;
   const startPercent = video?.durationSeconds ? start / video.durationSeconds * 100 : 0;
@@ -190,6 +260,70 @@ export function VideoToGifPage() {
     if (player.current) player.current.currentTime = 0;
   }
 
+  async function createGif() {
+    if (!video || !validPlan || isCreating) return;
+    setIsCreating(true);
+    setCreationError("");
+    setResult(null);
+    setProgress(null);
+    try {
+      const created = await invoke<GifResult>("create_video_gif", {
+        request: {
+          path: video.path,
+          destinationDir: destination,
+          outputName,
+          startSeconds: start,
+          endSeconds: end,
+          dimension,
+          customWidth: dimension === "custom" ? customWidth : null,
+          keepAspectRatio,
+          framesPerSecond: selectedFrameRate,
+          quality,
+          optimizeColors,
+          dithering,
+          playCount: selectedPlayCount,
+        },
+      });
+      setResult({ ...created, estimatedSize: estimate.estimatedBytes });
+    } catch (reason) {
+      const key = gifErrorKey(reason);
+      setCreationError(key ? t(key) : errorMessage(reason));
+    } finally {
+      setIsCreating(false);
+      setProgress(null);
+    }
+  }
+
+  async function cancelGif() {
+    try {
+      await invoke("cancel_video_gif");
+    } catch (reason) {
+      const key = gifErrorKey(reason);
+      setCreationError(key ? t(key) : errorMessage(reason));
+    }
+  }
+
+  async function openPath(path: string) {
+    try {
+      await openSystemPath(path);
+    } catch {
+      try {
+        await revealSystemItem(path);
+        setCreationError(t("gifOpenFallback"));
+      } catch {
+        setCreationError(t("gifOpenFailed"));
+      }
+    }
+  }
+
+  async function revealItemInDir(path: string) {
+    try {
+      await revealSystemItem(path);
+    } catch {
+      setCreationError(t("gifFolderOpenFailed"));
+    }
+  }
+
   return <div className="page video-gif-page">
     <header className="page-header compression-header video-header">
       <div><span className="eyebrow">{t("videoGifModuleLabel")}</span><h1>{t("videoGifTitle")}</h1><p>{t("videoGifSubtitle")}</p></div>
@@ -212,7 +346,7 @@ export function VideoToGifPage() {
 
         <section className="compress-panel gif-option-panel"><div className="video-section-title"><Film size={18} /><div><h2>{t("gifFrameRate")}</h2><p>{t("gifFrameRateHint")}</p></div></div><label className="convert-select"><span>{t("gifFrameRate")}</span><select value={frameRate} onChange={(event) => setFrameRate(event.target.value as FrameRateOption)}>{["5", "10", "15", "20", "24", "30"].map((value) => <option key={value} value={value}>{value} fps</option>)}<option value="custom">{t("gifCustomFrameRate")}</option></select></label>{frameRate === "custom" && <label className="convert-custom-single"><span>{t("gifCustomFrameRate")}</span><input type="number" min="1" max="120" step="1" value={customFrameRate} onChange={(event) => setCustomFrameRate(Number(event.target.value))} /></label>}{frameRateInvalid && <p className="convert-validation"><AlertCircle size={13} />{t("gifInvalidFrameRate")}</p>}</section>
 
-        <section className="compress-panel gif-option-panel"><div className="video-section-title"><Images size={18} /><div><h2>{t("gifQuality")}</h2><p>{t("gifQualityHint")}</p></div></div><div className="gif-choice-buttons">{(["small", "balanced", "high", "maximum"] as GifQuality[]).map((value) => <button type="button" className={quality === value ? "active" : ""} key={value} onClick={() => setQuality(value)}>{t(value === "small" ? "gifQualitySmall" : value === "balanced" ? "gifQualityBalanced" : value === "high" ? "gifQualityHigh" : "gifQualityMaximum")}</button>)}</div><label className="gif-check"><input type="checkbox" checked={optimizeColors} onChange={(event) => setOptimizeColors(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><strong>{t("gifOptimizeColors")}</strong></label><label className="convert-select"><span>{t("gifDithering")}</span><select value={dithering} onChange={(event) => setDithering(event.target.value as GifDithering)}><option value="none">{t("gifDitherNone")}</option><option value="bayer">Bayer</option><option value="floydSteinberg">Floyd-Steinberg</option></select></label></section>
+        <section className="compress-panel gif-option-panel"><div className="video-section-title"><Images size={18} /><div><h2>{t("gifQuality")}</h2><p>{t("gifQualityHint")}</p></div></div><div className="gif-choice-buttons">{(["small", "balanced", "high", "maximum"] as GifQuality[]).map((value) => <button type="button" className={quality === value ? "active" : ""} key={value} onClick={() => setQuality(value)}>{t(value === "small" ? "gifQualitySmall" : value === "balanced" ? "gifQualityBalanced" : value === "high" ? "gifQualityHigh" : "gifQualityMaximum")}</button>)}</div><label className="gif-check"><input type="checkbox" checked={optimizeColors} onChange={(event) => setOptimizeColors(event.target.checked)} /><span className="custom-check"><Check size={13} /></span><strong>{t("gifOptimizeColors")}</strong></label>{!optimizeColors && <p className="gif-duration-warning"><AlertCircle size={14} />{t("gifOptimizeColorsDisabledHint")}</p>}<label className="convert-select"><span>{t("gifDithering")}</span><select value={dithering} disabled={!optimizeColors} onChange={(event) => setDithering(event.target.value as GifDithering)}><option value="none">{t("gifDitherNone")}</option><option value="bayer">Bayer</option><option value="floydSteinberg">Floyd-Steinberg</option></select></label></section>
 
         <section className="compress-panel gif-option-panel"><div className="video-section-title"><RotateCcw size={18} /><div><h2>{t("gifLoop")}</h2><p>{t("gifLoopHint")}</p></div></div><label className="convert-select"><span>{t("gifLoop")}</span><select value={loop} onChange={(event) => setLoop(event.target.value as LoopOption)}><option value="infinite">{t("gifLoopInfinite")}</option><option value="1">{t("gifLoopOnce")}</option><option value="2">{t("gifLoopTwice")}</option><option value="3">{t("gifLoopThree")}</option><option value="custom">{t("gifLoopCustom")}</option></select></label>{loop === "custom" && <label className="convert-custom-single"><span>{t("gifLoopCustom")}</span><input type="number" min="1" step="1" value={customLoop} onChange={(event) => setCustomLoop(Number(event.target.value))} /></label>}{loopInvalid && <p className="convert-validation"><AlertCircle size={13} />{t("gifInvalidLoop")}</p>}</section>
       </div>
@@ -220,8 +354,13 @@ export function VideoToGifPage() {
       <section className="compress-panel gif-estimate"><div className="video-section-title"><Images size={18} /><div><h2>{t("gifEstimateTitle")}</h2><p>{t("gifEstimateHint")}</p></div></div><div className="gif-estimate-grid"><span><small>{t("gifEstimatedDuration")}</small><strong>{formatGifTime(selectedDuration)}</strong></span><span><small>{t("gifEstimatedDimensions")}</small><strong>{dimensions.width} × {dimensions.height}</strong></span><span><small>{t("gifEstimatedFrameRate")}</small><strong>{selectedFrameRate} fps</strong></span><span><small>{t("gifEstimatedFrames")}</small><strong>≈ {estimate.approximateFrames}</strong></span><span><small>{t("gifEstimatedSize")}</small><strong>≈ {formatBytes(estimate.estimatedBytes)}</strong></span></div><p className="gif-estimate-disclaimer"><AlertCircle size={13} />{t("gifEstimateDisclaimer")}</p></section>
 
       <section className="compress-panel video-destination-panel"><div><FolderOpen size={19} /><span><strong>{t("destinationFolder")}</strong><small title={destination ?? ""}>{destination ?? t("videoAutomaticDestination")}</small></span></div><button className="secondary-button" type="button" onClick={async () => { const selected = await open({ directory: true, multiple: false }); if (typeof selected === "string") setDestination(selected); }}>{t("chooseFolder")}</button></section><label className="compress-panel trim-output-name"><span>{t("gifOutputName")}</span><input value={outputName} onChange={(event) => setOutputName(event.target.value)} /></label>{nameInvalid && <p className="convert-validation gif-name-error"><AlertCircle size={13} />{t("gifInvalidName")}</p>}
-      <button className="run-button gif-create-button" type="button" disabled title={validPlan ? t("gifCreationDisabled") : t("gifFixValidation") }><Images size={19} />{t("gifCreateAction")}</button>
-      <p className="convert-interface-notice"><AlertCircle size={14} />{t("gifCreationDisabled")}</p>
+      {progress && <section className="video-progress-panel gif-progress-panel"><div><span>{t(progress.phase === "palette" ? "gifGeneratingPalette" : "gifCreatingPhase")}</span><strong>{t("gifCurrentStep")}: {progress.phase === "palette" ? "1 / 2" : "2 / 2"}</strong><b>{progress.overallPercent.toFixed(1)}%</b></div><div className="gif-progress-bars"><small>{t("gifPhaseProgress")} · {progress.phasePercent.toFixed(1)}%</small><progress max="100" value={progress.phasePercent} /><small>{t("gifOverallProgress")} · {progress.overallPercent.toFixed(1)}%</small><progress max="100" value={progress.overallPercent} /></div><small>{t("gifProcessedTime")}: {formatGifTime(progress.processedSeconds)} / {formatGifTime(progress.durationSeconds)}</small></section>}
+      {creationError && <p className="convert-validation gif-name-error"><AlertCircle size={13} />{creationError}</p>}
+      {result && <section className="compress-panel trim-result"><div className="convert-result-mode"><CheckCircle2 size={14} />{t("gifCreationComplete")}</div><div className="convert-result-grid"><span><small>{t("gifEstimatedDuration")}</small><strong>{formatGifTime(result.durationSeconds)}</strong></span><span><small>{t("gifEstimatedDimensions")}</small><strong>{result.width} × {result.height}</strong></span><span><small>{t("gifEstimatedFrameRate")}</small><strong>{result.framesPerSecond} fps</strong></span><span><small>{t("gifAppliedProfile")}</small><strong>{t(result.profile === "small" ? "gifQualitySmall" : result.profile === "balanced" ? "gifQualityBalanced" : result.profile === "high" ? "gifQualityHigh" : "gifQualityMaximum")}</strong></span><span><small>{t("gifOptimizeColors")}</small><strong>{t(result.optimizeColors ? "enabled" : "disabled")}</strong></span><span><small>{t("gifDithering")}</small><strong>{result.optimizeColors ? result.dithering === "none" ? t("gifDitherNone") : result.dithering === "bayer" ? "Bayer" : "Floyd-Steinberg" : "—"}</strong></span><span><small>{t("convertFinalSize")}</small><strong>{formatBytes(result.finalSize)}</strong></span><span><small>{t("processingDuration")}</small><strong>{formatGifTime(result.processingDurationSeconds)}</strong></span></div><div className="video-result-location"><FolderOpen size={13} /><span title={result.outputPath}>{result.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => void openPath(result.outputPath)}><Images size={13} />{t("gifOpen")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(result.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></section>}
+      {result && <p className="gif-estimate-disclaimer">{t("gifLoopResult")}: <strong>{result.playCount === null ? t("gifLoopInfinite") : result.playCount === 1 ? t("gifLoopOnce") : `${result.playCount} ${t("gifPlays")}`}</strong> · {t("gifFrameCount")}: <strong>{result.frameCount}</strong></p>}
+      {result && <section className="compress-panel gif-final-summary"><div className="convert-result-grid"><span><small>{t("trimRequestedStart")}</small><strong>{formatGifTime(result.startSeconds)}</strong></span><span><small>{t("trimRequestedEnd")}</small><strong>{formatGifTime(result.endSeconds)}</strong></span><span><small>{t("gifEstimatedFrames")}</small><strong>≈ {Math.ceil(result.durationSeconds * result.framesPerSecond)}</strong></span><span><small>{t("gifEstimatedSize")}</small><strong>≈ {formatBytes(result.estimatedSize)}</strong></span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => setPreviewResult(true)}><Play size={13} />{t("gifPreview")}</button><button className="text-button" type="button" onClick={() => void openPath(result.outputPath)}><Images size={13} />{t("gifOpen")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(result.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></section>}
+      {isCreating ? <button className="run-button video-cancel-button gif-create-button" type="button" onClick={() => void cancelGif()}><Ban size={19} />{t("gifCancel")}</button> : <button className="run-button gif-create-button" type="button" disabled={!validPlan} title={!validPlan ? t("gifFixValidation") : undefined} onClick={() => void createGif()}><Images size={19} />{t("gifCreateAction")}</button>}
+      {previewResult && result && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(false); }}><section className="pdf-image-preview-modal" role="dialog" aria-modal="true" aria-label={t("gifPreview")}><header><div><strong>{result.outputName}</strong><small>{result.width} × {result.height} · {result.framesPerSecond} fps</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(false)}><X size={17} /></button></header><div><img src={convertFileSrc(result.outputPath)} alt={result.outputName} /></div></section></div>}
     </>}
   </div>;
 }

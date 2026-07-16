@@ -14,6 +14,7 @@ mod trim_video_plan;
 mod video_compression;
 mod video_conversion;
 mod video_conversion_plan;
+mod video_gif;
 #[allow(dead_code)]
 mod video_gif_plan;
 #[allow(dead_code)]
@@ -42,6 +43,7 @@ use video_compression::{
 };
 use video_conversion::{cancel_video_conversion, convert_video, VideoConversionState};
 use video_conversion_plan::{get_video_conversion_capabilities, plan_video_conversion};
+use video_gif::{cancel_video_gif, create_video_gif, VideoGifState};
 use video_gif_plan::allow_video_gif_preview;
 use video_tools::inspect_video;
 
@@ -52,6 +54,7 @@ pub fn run() {
         .manage(VideoConversionState::default())
         .manage(AudioExtractionState::default())
         .manage(TrimVideoState::default())
+        .manage(VideoGifState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -91,7 +94,9 @@ pub fn run() {
             cancel_fast_trim,
             precise_trim_video,
             cancel_precise_trim,
-            allow_video_gif_preview
+            allow_video_gif_preview,
+            create_video_gif,
+            cancel_video_gif
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

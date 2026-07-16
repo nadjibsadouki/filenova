@@ -1265,7 +1265,31 @@ button { color: inherit; }
 .gif-estimate-grid strong { margin-top: 4px; direction: ltr; color: #366d55; font-size: 8px; unicode-bidi: isolate; }
 .gif-name-error { margin: 8px 2px 0; }
 .gif-create-button { margin-top: 12px; }
-[dir="rtl"] .video-gif-page .video-section-title, [dir="rtl"] .video-gif-source, [dir="rtl"] .gif-option-panel, [dir="rtl"] .gif-estimate { text-align: right; }
+.gif-progress-bars { display: grid; gap: 5px; margin: 9px 0; }
+.gif-progress-bars small { color: #718078; font-size: 7px; }
+.gif-final-summary { margin-top: 10px; }
+.gif-final-summary .video-result-actions { margin-top: 10px; }
+.video-gif-page .trim-result .video-result-actions { display: none; }
+[dir="rtl"] .video-gif-page .video-section-title,
+[dir="rtl"] .video-gif-source,
+[dir="rtl"] .gif-timeline-panel,
+[dir="rtl"] .gif-option-panel,
+[dir="rtl"] .gif-estimate,
+[dir="rtl"] .gif-progress-panel,
+[dir="rtl"] .gif-final-summary,
+[dir="rtl"] .video-gif-page .trim-result,
+[dir="rtl"] .video-gif-page .video-destination-panel,
+[dir="rtl"] .video-gif-page .trim-output-name { text-align: right; }
+[dir="rtl"] .video-gif-page .trim-time-fields input,
+[dir="rtl"] .video-gif-page .trim-permanent-times strong,
+[dir="rtl"] .gif-source-metadata strong,
+[dir="rtl"] .gif-estimate-grid strong,
+[dir="rtl"] .video-gif-page .convert-result-grid strong,
+[dir="rtl"] .video-gif-page .video-result-location span { direction: ltr; unicode-bidi: isolate; text-align: right; }
+[dir="rtl"] .gif-progress-bars small,
+[dir="rtl"] .gif-progress-panel > small { text-align: right; }
+[dir="rtl"] .video-gif-page .trim-timeline-actions,
+[dir="rtl"] .video-gif-page .video-result-actions { direction: rtl; }
 @media (max-width: 1050px) { .gif-settings-grid { grid-template-columns: 1fr; } .gif-estimate-grid { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 700px) { .gif-source-metadata, .gif-estimate-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 820px) { .video-drop-zone { flex-direction: column; text-align: center; } .video-settings-grid { grid-template-columns: 1fr; } .video-file-row { grid-template-columns: 110px minmax(0, 1fr); } .video-thumbnail { width: 110px; } .video-remove-button { grid-column: 2; justify-self: end; } }

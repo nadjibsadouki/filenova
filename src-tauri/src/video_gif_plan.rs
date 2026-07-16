@@ -29,20 +29,41 @@ pub(crate) struct GifDimensions {
 pub(crate) fn calculate_dimensions(
     source_width: u64,
     source_height: u64,
-    requested_width: u64,
+    requested_width: f64,
     keep_aspect_ratio: bool,
 ) -> Option<GifDimensions> {
-    if source_width < 2 || source_height < 2 || requested_width < 2 {
+    if source_width < 2
+        || source_height < 2
+        || !requested_width.is_finite()
+        || requested_width < 2.0
+    {
         return None;
     }
-    let even = |value: f64| ((value.floor() as u64).max(2) / 2) * 2;
-    let width = even(requested_width.min(source_width) as f64);
+    let even_floor = |value: f64| ((value.floor() as u64).max(2) / 2) * 2;
+    let even_nearest = |value: f64| (((value / 2.0).round() as u64).max(1)) * 2;
+    let width = even_floor(requested_width.min(source_width as f64));
     let height = if keep_aspect_ratio {
-        even(source_height as f64 * width as f64 / source_width as f64)
+        even_nearest(source_height as f64 * width as f64 / source_width as f64)
     } else {
-        even(source_height as f64)
+        even_floor(source_height as f64)
     };
     Some(GifDimensions { width, height })
+}
+
+pub(crate) fn resolve_requested_width(
+    source_width: u64,
+    dimension: &str,
+    custom_width: Option<f64>,
+) -> Option<f64> {
+    match dimension {
+        "original" => (source_width >= 2).then_some(source_width as f64),
+        "1080" => Some(1080.0),
+        "720" => Some(720.0),
+        "480" => Some(480.0),
+        "360" => Some(360.0),
+        "custom" => custom_width.filter(|width| width.is_finite() && *width >= 2.0),
+        _ => None,
+    }
 }
 
 pub(crate) fn estimate_frames(duration_seconds: f64, frames_per_second: f64) -> Option<u64> {
@@ -54,6 +75,14 @@ pub(crate) fn estimate_frames(duration_seconds: f64, frames_per_second: f64) -> 
         return None;
     }
     Some((duration_seconds * frames_per_second).ceil() as u64)
+}
+
+pub(crate) fn validate_frame_rate(frames_per_second: f64) -> Result<(), &'static str> {
+    if frames_per_second.is_finite() && (1.0..=120.0).contains(&frames_per_second) {
+        Ok(())
+    } else {
+        Err("invalid_frame_rate")
+    }
 }
 
 pub(crate) fn validate_selection(start: f64, end: f64, duration: f64) -> Result<(), &'static str> {
@@ -155,26 +184,45 @@ mod tests {
     #[test]
     fn calculates_horizontal_and_vertical_dimensions_without_upscaling() {
         assert_eq!(
-            calculate_dimensions(1920, 1080, 720, true),
+            calculate_dimensions(1920, 1080, 720.0, true),
             Some(GifDimensions {
                 width: 720,
-                height: 404
+                height: 406
             })
         );
         assert_eq!(
-            calculate_dimensions(1080, 1920, 480, true),
+            calculate_dimensions(1080, 1920, 480.0, true),
             Some(GifDimensions {
                 width: 480,
-                height: 852
+                height: 854
             })
         );
         assert_eq!(
-            calculate_dimensions(320, 180, 1080, true),
+            calculate_dimensions(320, 180, 1080.0, true),
             Some(GifDimensions {
                 width: 320,
                 height: 180
             })
         );
+    }
+
+    #[test]
+    fn resolves_every_dimension_mode_and_rejects_invalid_widths() {
+        assert_eq!(resolve_requested_width(641, "original", None), Some(641.0));
+        assert_eq!(resolve_requested_width(641, "1080", None), Some(1080.0));
+        assert_eq!(resolve_requested_width(641, "720", None), Some(720.0));
+        assert_eq!(resolve_requested_width(641, "480", None), Some(480.0));
+        assert_eq!(resolve_requested_width(641, "360", None), Some(360.0));
+        assert_eq!(
+            resolve_requested_width(641, "custom", Some(422.0)),
+            Some(422.0)
+        );
+        assert_eq!(resolve_requested_width(641, "custom", Some(0.0)), None);
+        assert_eq!(resolve_requested_width(641, "custom", Some(-20.0)), None);
+        assert_eq!(resolve_requested_width(641, "custom", Some(f64::NAN)), None);
+        assert_eq!(resolve_requested_width(641, "unknown", None), None);
+        assert_eq!(calculate_dimensions(640, 360, 0.0, true), None);
+        assert_eq!(calculate_dimensions(640, 360, -10.0, true), None);
     }
 
     #[test]
@@ -210,6 +258,19 @@ mod tests {
     }
 
     #[test]
+    fn accepts_all_frame_rate_presets_and_custom_values() {
+        for frames_per_second in [5.0, 10.0, 15.0, 20.0, 24.0, 30.0, 17.5, 120.0] {
+            assert_eq!(validate_frame_rate(frames_per_second), Ok(()));
+        }
+        for frames_per_second in [0.0, -1.0, 120.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                validate_frame_rate(frames_per_second),
+                Err("invalid_frame_rate")
+            );
+        }
+    }
+
+    #[test]
     fn ffprobe_analyzes_real_horizontal_and_vertical_sources_for_gif_planning() {
         let temp = tempfile::tempdir().unwrap();
         let horizontal_path = temp.path().join("horizontal.mp4");
@@ -234,7 +295,7 @@ mod tests {
         assert_eq!((vertical.width, vertical.height), (360, 640));
         assert!((horizontal.frames_per_second - 15.0).abs() < 0.01);
         assert_eq!(
-            calculate_dimensions(vertical.width, vertical.height, 480, true),
+            calculate_dimensions(vertical.width, vertical.height, 480.0, true),
             Some(GifDimensions {
                 width: 360,
                 height: 640

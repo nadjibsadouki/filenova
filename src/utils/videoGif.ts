@@ -34,6 +34,11 @@ export function evenDimension(value: number) {
   return Math.max(2, Math.floor(value / 2) * 2);
 }
 
+function nearestEvenDimension(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.max(2, Math.round(value / 2) * 2);
+}
+
 export function calculateGifDimensions(
   sourceWidth: number,
   sourceHeight: number,
@@ -50,7 +55,7 @@ export function calculateGifDimensions(
   if (!Number.isFinite(requested) || requested <= 0) return { width: 0, height: 0, reduced: false };
   const width = evenDimension(Math.min(requested, sourceWidth));
   const height = keepAspectRatio
-    ? evenDimension(sourceHeight * width / sourceWidth)
+    ? nearestEvenDimension(sourceHeight * width / sourceWidth)
     : evenDimension(sourceHeight);
   return { width, height, reduced: width < evenDimension(sourceWidth) };
 }
