@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Check, Clapperboard, Crop, FileVideo2, FolderOpen, Grid3X3, Settings2, Trash2, UploadCloud } from "lucide-react";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { AlertTriangle, Ban, Check, CheckCircle2, Clapperboard, Crop, FileVideo2, FolderOpen, Grid3X3, Play, Settings2, Trash2, UploadCloud, Video, X } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 import {
   customObjectPosition,
@@ -32,6 +34,40 @@ interface VideoInfo {
   thumbnailData: number[] | null;
 }
 
+interface SocialExportResult {
+  outputPath: string;
+  outputName: string;
+  width: number;
+  height: number;
+  framesPerSecond: number;
+  videoCodec: string;
+  audioCodec: string | null;
+  finalSize: number;
+  processingDurationSeconds: number;
+}
+
+interface SocialExportProgress {
+  processedSeconds: number;
+  durationSeconds: number;
+  percent: number;
+  phase: string;
+}
+
+interface SocialExportSummary extends SocialExportResult {
+  platform: SocialPlatform;
+  presetId: string;
+  method: SocialMethod;
+  background: FitBackground;
+  backgroundColor: string;
+  cropPosition: CropPosition;
+  cropX: number;
+  cropY: number;
+  originalWidth: number;
+  originalHeight: number;
+  originalSize: number;
+  quality: SocialQuality;
+}
+
 const extensions = ["mp4", "mov", "mkv", "avi", "webm", "m4v"];
 const platforms: SocialPlatform[] = ["tiktok", "instagram", "youtube", "facebook", "linkedin", "x", "custom"];
 
@@ -46,8 +82,9 @@ function duration(value: number) {
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function defaultName(name: string) {
-  return `${name.replace(/\.[^.]+$/, "") || "video"}-social.mp4`;
+function defaultName(name: string, platform: SocialPlatform, presetId: string) {
+  const stem = name.replace(/\.[^.]+$/, "") || "video";
+  return `${stem}-${platform === "custom" ? "social" : presetId}.mp4`;
 }
 
 function platformKey(platform: SocialPlatform): TranslationKey {
@@ -70,6 +107,7 @@ export function SocialMediaToolsPage() {
   const [customHeight, setCustomHeight] = useState(1920);
   const [customRatio, setCustomRatio] = useState("9:16");
   const [method, setMethod] = useState<SocialMethod>("fit");
+  const [stretchConfirmed, setStretchConfirmed] = useState(false);
   const [background, setBackground] = useState<FitBackground>("black");
   const [backgroundColor, setBackgroundColor] = useState("#24332c");
   const [cropPosition, setCropPosition] = useState<CropPosition>("center");
@@ -83,16 +121,20 @@ export function SocialMediaToolsPage() {
   const [quality, setQuality] = useState<SocialQuality>("balanced");
   const [destination, setDestination] = useState<string | null>(null);
   const [outputName, setOutputName] = useState("");
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [exportResult, setExportResult] = useState<SocialExportSummary | null>(null);
+  const [exportProgress, setExportProgress] = useState<SocialExportProgress | null>(null);
+  const [previewResult, setPreviewResult] = useState(false);
 
   const loadVideo = useCallback(async (paths: string[]) => {
     const path = paths.find((candidate) => extensions.includes(candidate.split(".").pop()?.toLowerCase() ?? ""));
-    if (!path) return;
+    if (!path || isExporting) return;
     setStatus("analyzing");
     setError("");
     try {
       const info = await invoke<VideoInfo>("inspect_video", { path });
       setVideo(info);
-      setOutputName(defaultName(info.name));
       setCustomFrameRate(Math.max(1, Math.round(info.framesPerSecond)));
       setStatus("ready");
       setThumbnail((current) => {
@@ -106,6 +148,19 @@ export function SocialMediaToolsPage() {
       setStatus("failed");
       setError(String(reason));
     }
+  }, [isExporting]);
+
+  useEffect(() => {
+    if (video) setOutputName(defaultName(video.name, platform, presetId));
+  }, [video?.path, platform, presetId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    listen<SocialExportProgress>("social-media-export-progress", (event) => {
+      if (!disposed) setExportProgress(event.payload);
+    }).then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
+    return () => { disposed = true; cleanup?.(); };
   }, []);
 
   useEffect(() => () => { if (thumbnail) URL.revokeObjectURL(thumbnail); }, [thumbnail]);
@@ -129,9 +184,12 @@ export function SocialMediaToolsPage() {
   const upscaling = !!video && (targetWidth > video.width || targetHeight > video.height);
   const objectPosition = customObjectPosition(cropPosition, cropX, cropY);
   const plannedFrameRate = preserveFrameRate ? video?.framesPerSecond ?? 0 : customFrameRate;
+  const stretchReady = method !== "stretch" || stretchConfirmed;
+  const baseExportReady = valid && stretchReady;
   const previewBackground = background === "white" ? "#fff" : background === "custom" ? backgroundColor : "#101412";
 
   async function chooseVideo() {
+    if (isExporting) return;
     const selected = await open({ multiple: false, directory: false, filters: [{ name: "MP4, MOV, MKV, AVI, WebM, M4V", extensions }] });
     if (typeof selected === "string") await loadVideo([selected]);
   }
@@ -145,9 +203,115 @@ export function SocialMediaToolsPage() {
     else if (value === "youtube") setSafeZone("youtube");
   }
 
+  async function exportVideo() {
+    if (!video || !baseExportReady || isExporting) return;
+    setIsExporting(true);
+    setExportError("");
+    setExportResult(null);
+    setPreviewResult(false);
+    setExportProgress({ processedSeconds: 0, durationSeconds: video.durationSeconds, percent: 0, phase: "preparing" });
+    try {
+      const result = await invoke<SocialExportResult>("export_social_media_video", {
+        request: {
+          path: video.path,
+          destinationDir: destination,
+          outputName,
+          targetWidth,
+          targetHeight,
+          method,
+          stretchConfirmed,
+          background,
+          customColor: background === "custom" ? backgroundColor : null,
+          cropPosition,
+          cropX,
+          cropY,
+          preserveFrameRate,
+          framesPerSecond: customFrameRate,
+          preserveAudio,
+          preserveMetadata,
+          quality,
+        },
+      });
+      setExportResult({
+        ...result,
+        platform,
+        presetId,
+        method,
+        background,
+        backgroundColor,
+        cropPosition,
+        cropX,
+        cropY,
+        originalWidth: video.width,
+        originalHeight: video.height,
+        originalSize: video.size,
+        quality,
+      });
+    } catch (reason) {
+      const code = reason && typeof reason === "object" && "code" in reason ? String(reason.code) : "";
+      const keys: Record<string, TranslationKey> = {
+        social_export_busy: "socialExportBusy", ffmpeg_unavailable: "socialFfmpegUnavailable",
+        ffprobe_unavailable: "socialFfprobeUnavailable", social_encoder_unavailable: "socialEncoderUnavailable",
+        invalid_social_dimensions: "socialInvalidDimensions", invalid_social_frame_rate: "socialInvalidFrameRate",
+        stretch_confirmation_required: "socialStretchConfirmationRequired",
+        invalid_social_quality: "socialInvalidQuality", social_export_cancelled: "socialExportCancelled",
+        social_cancel_failed: "socialCancelFailed",
+        invalid_social_background: "socialInvalidBackground", invalid_crop_position: "socialInvalidCropPosition",
+        destination_inaccessible: "socialDestinationFailed", disk_full: "socialDiskFull",
+        social_output_invalid: "socialOutputInvalid", social_export_failed: "socialExportFailed",
+        invalid_output_name: "socialInvalidOutputName",
+      };
+      const key = keys[code];
+      setExportError(key ? t(key) : String(reason));
+    } finally {
+      setIsExporting(false);
+      setExportProgress(null);
+    }
+  }
+
+  async function cancelExport() {
+    try {
+      await invoke<boolean>("cancel_social_media_export");
+    } catch (reason) {
+      const message = reason && typeof reason === "object" && "message" in reason ? String(reason.message) : String(reason);
+      setExportError(message || t("socialCancelFailed"));
+    }
+  }
+
+  async function openExportedVideo(path: string) {
+    try {
+      await openPath(path);
+    } catch {
+      setExportError(t("socialOpenVideoFailed"));
+    }
+  }
+
+  async function revealExportedVideo(path: string) {
+    try {
+      await revealItemInDir(path);
+    } catch {
+      setExportError(t("socialOpenFolderFailed"));
+    }
+  }
+
+  function backgroundOrCrop(result: SocialExportSummary) {
+    if (result.method === "stretch") return t("socialStretchPlan");
+    if (result.method === "fit") {
+      if (result.background === "custom") return `${t("backgroundCustom")} · ${result.backgroundColor.toUpperCase()}`;
+      return t(result.background === "black" ? "backgroundBlack" : result.background === "white" ? "backgroundWhite" : "socialBlurredBackground");
+    }
+    if (result.cropPosition === "custom") return `${t("socialCustomPosition")} · X ${result.cropX}% · Y ${result.cropY}%`;
+    return t(result.cropPosition === "center" ? "socialCenter" : result.cropPosition === "top" ? "socialTop" : result.cropPosition === "bottom" ? "socialBottom" : result.cropPosition === "left" ? "socialLeft" : "socialRight");
+  }
+
+  function qualityLabel(value: SocialQuality): TranslationKey {
+    return value === "smaller" ? "socialQualitySmaller" : value === "balanced" ? "gifQualityBalanced" : value === "high" ? "gifQualityHigh" : "gifQualityMaximum";
+  }
+
   const cropDescription = method === "fit" ? t("socialNoCrop") : method === "stretch" ? t("socialStretchPlan")
     : crop?.axis === "horizontal" ? t("socialHorizontalCrop", { percent: crop.percent.toFixed(1) })
       : crop?.axis === "vertical" ? t("socialVerticalCrop", { percent: crop.percent.toFixed(1) }) : t("socialNoCrop");
+  const resultPreset = exportResult ? socialPresets.find((preset) => preset.id === exportResult.presetId) : null;
 
   return <div className="page social-media-page">
     <header className="page-header compression-header video-header">
@@ -165,7 +329,7 @@ export function SocialMediaToolsPage() {
       <section className="compress-panel social-preset-panel"><div className="video-section-title"><Grid3X3 size={18}/><div><h2>{t("socialPlatformsPresets")}</h2><p>{t("socialPlatformsHint")}</p></div></div><div className="social-platform-tabs">{platforms.map((value) => <button type="button" key={value} className={platform === value ? "active" : ""} onClick={() => choosePlatform(value)}>{t(platformKey(value))}</button>)}</div>{platform !== "custom" ? <div className="social-preset-grid">{availablePresets.map((preset) => <button type="button" key={preset.id} className={presetId === preset.id ? "active" : ""} onClick={() => setPresetId(preset.id)}><strong>{t(preset.labelKey as TranslationKey)}</strong><small>{preset.width} × {preset.height} · {preset.ratioLabel}</small></button>)}</div> : <div className="social-custom-grid"><label><span>{t("width")}</span><input type="number" min="1" value={customWidth} onChange={(event) => setCustomWidth(Number(event.target.value))}/></label><label><span>{t("height")}</span><input type="number" min="1" value={customHeight} onChange={(event) => setCustomHeight(Number(event.target.value))}/></label><label><span>{t("socialCustomRatio")}</span><input dir="ltr" value={customRatio} onChange={(event) => setCustomRatio(event.target.value)}/></label></div>}</section>
 
       <div className="social-workspace-grid">
-        <section className="compress-panel social-settings"><div className="video-section-title"><Crop size={18}/><div><h2>{t("socialAdaptationMethod")}</h2><p>{t("socialAdaptationHint")}</p></div></div><div className="social-methods">{(["fit", "fill", "stretch"] as SocialMethod[]).map((value) => <button type="button" key={value} className={method === value ? "active" : ""} onClick={() => setMethod(value)}><strong>{t(value === "fit" ? "fitMethod" : value === "fill" ? "fillMethod" : "stretchMethod")}</strong><small>{t(value === "fit" ? "socialFitHint" : value === "fill" ? "socialFillHint" : "socialStretchHint")}</small></button>)}</div>{method === "stretch" && <p className="social-warning"><AlertTriangle size={14}/>{t("socialStretchWarning")}</p>}
+        <section className="compress-panel social-settings"><div className="video-section-title"><Crop size={18}/><div><h2>{t("socialAdaptationMethod")}</h2><p>{t("socialAdaptationHint")}</p></div></div><div className="social-methods">{(["fit", "fill", "stretch"] as SocialMethod[]).map((value) => <button type="button" key={value} className={method === value ? "active" : ""} onClick={() => { setMethod(value); if (value === "stretch") setStretchConfirmed(false); }}><strong>{t(value === "fit" ? "fitMethod" : value === "fill" ? "fillMethod" : "stretchMethod")}</strong><small>{t(value === "fit" ? "socialFitHint" : value === "fill" ? "socialFillHint" : "socialStretchHint")}</small></button>)}</div>{method === "stretch" && <><p className="social-warning"><AlertTriangle size={14}/>{t("socialStretchWarning")}</p><label className="gif-check social-stretch-confirm"><input type="checkbox" checked={stretchConfirmed} onChange={(event) => setStretchConfirmed(event.target.checked)}/><span className="custom-check"><Check size={13}/></span><strong>{t("socialConfirmStretch")}</strong></label></>}
           {method === "fit" && <div className="social-subsettings"><strong>{t("socialFitBackground")}</strong><div className="social-inline-options">{(["black", "white", "custom", "blurred"] as FitBackground[]).map((value) => <button type="button" className={background === value ? "active" : ""} key={value} onClick={() => setBackground(value)}>{t(value === "black" ? "backgroundBlack" : value === "white" ? "backgroundWhite" : value === "custom" ? "backgroundCustom" : "socialBlurredBackground")}</button>)}</div>{background === "custom" && <input aria-label={t("customColor")} type="color" value={backgroundColor} onChange={(event) => setBackgroundColor(event.target.value)}/>} {background === "blurred" && <small>{t("socialBlurredPreviewOnly")}</small>}</div>}
           {method === "fill" && <div className="social-subsettings"><strong>{t("socialCropPosition")}</strong><div className="social-inline-options">{(["center", "top", "bottom", "left", "right", "custom"] as CropPosition[]).map((value) => <button type="button" className={cropPosition === value ? "active" : ""} key={value} onClick={() => setCropPosition(value)}>{t(value === "center" ? "socialCenter" : value === "top" ? "socialTop" : value === "bottom" ? "socialBottom" : value === "left" ? "socialLeft" : value === "right" ? "socialRight" : "socialCustomPosition")}</button>)}</div>{cropPosition === "custom" && <div className="social-position-fields"><label>X<input type="range" min="0" max="100" value={cropX} onChange={(event) => setCropX(Number(event.target.value))}/><b>{cropX}%</b></label><label>Y<input type="range" min="0" max="100" value={cropY} onChange={(event) => setCropY(Number(event.target.value))}/><b>{cropY}%</b></label></div>}</div>}
         </section>
@@ -179,7 +343,12 @@ export function SocialMediaToolsPage() {
 
       <section className="compress-panel video-destination-panel social-destination"><div><small>{t("destinationFolder")}</small><strong title={destination ?? ""}>{destination ?? t("sameFolder")}</strong></div><button className="secondary-button" type="button" onClick={async () => { const selected = await open({ directory: true, multiple: false }); if (typeof selected === "string") setDestination(selected); }}><FolderOpen size={14}/>{t("chooseFolder")}</button></section><label className="compress-panel trim-output-name social-output-name"><span>{t("socialOutputName")}</span><input value={outputName} onChange={(event) => setOutputName(event.target.value)}/></label>
       {!valid && <p className="convert-validation social-validation"><AlertTriangle size={13}/>{t("socialInvalidConfiguration")}</p>}
-      <button className="run-button social-export-button" type="button" disabled title={t("socialExportDisabled")}><Clapperboard size={19}/>{t("socialExportVideo")}</button>
+      {valid && method === "stretch" && !stretchConfirmed && <p className="convert-validation social-validation"><AlertTriangle size={13}/>{t("socialStretchConfirmationRequired")}</p>}
+      {exportError && <p className="convert-validation social-validation"><AlertTriangle size={13}/>{exportError}</p>}
+      {exportResult && <section className="compress-panel social-export-result"><div className="convert-result-mode"><CheckCircle2 size={14}/>{t("socialExportComplete")}</div><div className="social-plan-grid"><span><small>{t("socialPlatform")}</small><strong className="social-result-text">{t(platformKey(exportResult.platform))}</strong></span><span><small>{t("socialPreset")}</small><strong className="social-result-text">{exportResult.platform === "custom" ? t("socialCustom") : t((resultPreset?.labelKey ?? "socialCustom") as TranslationKey)}</strong></span><span><small>{t("socialMethod")}</small><strong className="social-result-text">{t(exportResult.method === "fit" ? "fitMethod" : exportResult.method === "fill" ? "fillMethod" : "stretchMethod")}</strong></span><span><small>{t(exportResult.method === "fit" ? "socialAppliedBackground" : exportResult.method === "fill" ? "socialAppliedCropPosition" : "socialAdaptationDetail")}</small><strong className="social-result-text">{backgroundOrCrop(exportResult)}</strong></span><span><small>{t("socialOriginalDimensions")}</small><strong>{exportResult.originalWidth} × {exportResult.originalHeight}</strong></span><span><small>{t("socialFinalDimensions")}</small><strong>{exportResult.width} × {exportResult.height}</strong></span><span><small>{t("socialFinalRatio")}</small><strong>{ratioLabel(exportResult.width, exportResult.height)}</strong></span><span><small>{t("socialFinalFrameRate")}</small><strong>{exportResult.framesPerSecond.toFixed(3)} fps</strong></span><span><small>{t("videoCodec")}</small><strong>{exportResult.videoCodec}</strong></span><span><small>{t("audioCodec")}</small><strong>{exportResult.audioCodec ?? t("noAudio")}</strong></span><span><small>{t("socialVideoQuality")}</small><strong className="social-result-text">{t(qualityLabel(exportResult.quality))}</strong></span><span><small>{t("originalSize")}</small><strong>{bytes(exportResult.originalSize)}</strong></span><span><small>{t("convertFinalSize")}</small><strong>{bytes(exportResult.finalSize)}</strong></span><span><small>{t("processingDuration")}</small><strong>{exportResult.processingDurationSeconds.toFixed(2)} s</strong></span></div><div className="video-result-location"><FolderOpen size={13}/><span title={exportResult.outputPath}>{exportResult.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => setPreviewResult(true)}><Play size={13}/>{t("previewVideo")}</button><button className="text-button" type="button" onClick={() => void openExportedVideo(exportResult.outputPath)}><Video size={13}/>{t("openVideo")}</button><button className="text-button" type="button" onClick={() => void revealExportedVideo(exportResult.outputPath)}><FolderOpen size={13}/>{t("openFolder")}</button></div></section>}
+      {exportProgress && <section className="video-progress-panel social-progress"><div><span>{t("socialPreparingVideo")}</span><strong>{video.name}</strong><b>{exportProgress.percent.toFixed(1)}%</b></div><progress max="100" value={exportProgress.percent}/><small>{duration(exportProgress.processedSeconds)} / {duration(exportProgress.durationSeconds)}</small></section>}
+      {isExporting ? <button className="run-button video-cancel-button social-export-button" type="button" onClick={() => void cancelExport()}><Ban size={19}/>{t("socialCancelExport")}</button> : <button className="run-button social-export-button" type="button" disabled={!baseExportReady} title={method === "stretch" && !stretchConfirmed ? t("socialStretchConfirmationRequired") : undefined} onClick={() => void exportVideo()}><Clapperboard size={19}/>{t("socialExportVideo")}</button>}
     </>}
+    {previewResult && exportResult && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(false); }}><section className="video-preview-modal" role="dialog" aria-modal="true" aria-label={t("previewVideo")}><header><div><strong>{exportResult.outputName}</strong><small>{exportResult.width} × {exportResult.height} · {exportResult.framesPerSecond.toFixed(3)} fps · {exportResult.videoCodec}</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(false)} aria-label={t("closePreview")}><X size={17}/></button></header><video src={convertFileSrc(exportResult.outputPath)} controls autoPlay/></section></div>}
   </div>;
 }

@@ -1358,9 +1358,14 @@ button { color: inherit; }
 .social-output-name { padding: 13px; }
 .social-validation { margin-top: 9px; }
 .social-export-button { margin-top: 12px; }
+.social-export-result { margin-top: 11px; padding: 13px; color: #356c53; }
+.social-export-result > small { display: block; overflow: hidden; margin-top: 9px; direction: ltr; color: #73827a; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; unicode-bidi: isolate; }
 [dir="rtl"] .social-media-page .video-section-title, [dir="rtl"] .social-source, [dir="rtl"] .social-preset-panel, [dir="rtl"] .social-settings, [dir="rtl"] .social-preview-panel, [dir="rtl"] .social-options, [dir="rtl"] .social-export-plan, [dir="rtl"] .social-destination, [dir="rtl"] .social-output-name { text-align: right; }
 [dir="rtl"] .social-preset-grid button, [dir="rtl"] .social-methods button { text-align: right; }
 [dir="rtl"] .social-metadata strong, [dir="rtl"] .social-plan-grid strong, [dir="rtl"] .social-custom-grid input, [dir="rtl"] .social-output-name input, [dir="rtl"] .social-destination strong { direction: ltr; unicode-bidi: isolate; text-align: right; }
 [dir="rtl"] .social-safe-zone span { direction: rtl; }
+[dir="rtl"] .social-export-result { text-align: right; }
+[dir="rtl"] .social-export-result .social-result-text { direction: rtl; text-align: right; unicode-bidi: plaintext; }
+[dir="rtl"] .social-export-result .video-result-actions { direction: rtl; }
 @media (max-width: 1050px) { .social-metadata { grid-template-columns: repeat(4, 1fr); } .social-preset-grid { grid-template-columns: repeat(3, 1fr); } .social-workspace-grid { grid-template-columns: 1fr; } .social-option-grid { grid-template-columns: repeat(2, 1fr); } .social-plan-grid { grid-template-columns: repeat(3, 1fr); } .social-plan-grid span:nth-child(5n) { border-inline-end: 1px solid #e3eae7; } .social-plan-grid span:nth-child(3n) { border-inline-end: 0; } .social-plan-grid span:nth-child(n+4) { border-top: 1px solid #e3eae7; } }
 @media (max-width: 700px) { .social-metadata, .social-preset-grid, .social-custom-grid, .social-methods, .social-option-grid, .social-plan-grid { grid-template-columns: 1fr 1fr; } .social-plan-grid span:nth-child(3n) { border-inline-end: 1px solid #e3eae7; } .social-plan-grid span:nth-child(2n) { border-inline-end: 0; } .social-preview-stage { min-height: 210px; } }

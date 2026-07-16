@@ -8,6 +8,7 @@ mod pdf_organize;
 mod pdf_split;
 mod pdf_to_images;
 mod resizing;
+mod social_media_export;
 #[allow(dead_code)]
 mod social_media_plan;
 mod trim_video;
@@ -35,6 +36,9 @@ use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
 use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_output};
 use resizing::resize_image;
+use social_media_export::{
+    cancel_social_media_export, export_social_media_video, SocialExportState,
+};
 use trim_video::{
     cancel_fast_trim, cancel_precise_trim, fast_trim_video, precise_trim_video, TrimVideoState,
 };
@@ -57,6 +61,7 @@ pub fn run() {
         .manage(AudioExtractionState::default())
         .manage(TrimVideoState::default())
         .manage(VideoGifState::default())
+        .manage(SocialExportState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -98,7 +103,9 @@ pub fn run() {
             cancel_precise_trim,
             allow_video_gif_preview,
             create_video_gif,
-            cancel_video_gif
+            cancel_video_gif,
+            export_social_media_video,
+            cancel_social_media_export
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");
