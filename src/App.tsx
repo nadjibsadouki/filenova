@@ -11,6 +11,7 @@ import { CompressVideoPage } from "./pages/CompressVideoPage";
 import { ConvertVideoPage } from "./pages/ConvertVideoPage";
 import { ExtractAudioPage } from "./pages/ExtractAudioPage";
 import { TrimVideoPage } from "./pages/TrimVideoPage";
+import { VideoToGifPage } from "./pages/VideoToGifPage";
 
 function App() {
   const [activePage, setActivePage] = useState<PageId>("home");
@@ -38,6 +39,8 @@ function App() {
           <ExtractAudioPage />
         ) : activePage === "trim-video" ? (
           <TrimVideoPage />
+        ) : activePage === "video-to-gif" ? (
+          <VideoToGifPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}

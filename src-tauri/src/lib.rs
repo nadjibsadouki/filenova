@@ -15,6 +15,8 @@ mod video_compression;
 mod video_conversion;
 mod video_conversion_plan;
 #[allow(dead_code)]
+mod video_gif_plan;
+#[allow(dead_code)]
 mod video_target_size;
 mod video_tools;
 
@@ -40,6 +42,7 @@ use video_compression::{
 };
 use video_conversion::{cancel_video_conversion, convert_video, VideoConversionState};
 use video_conversion_plan::{get_video_conversion_capabilities, plan_video_conversion};
+use video_gif_plan::allow_video_gif_preview;
 use video_tools::inspect_video;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -87,7 +90,8 @@ pub fn run() {
             fast_trim_video,
             cancel_fast_trim,
             precise_trim_video,
-            cancel_precise_trim
+            cancel_precise_trim,
+            allow_video_gif_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

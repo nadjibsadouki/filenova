@@ -3,6 +3,7 @@ import {
   Clock3,
   FileText,
   FileAudio2,
+  Images,
   House,
   ImageDown,
   RefreshCw,
@@ -21,6 +22,7 @@ export type PageId =
   | "convert-video"
   | "extract-audio"
   | "trim-video"
+  | "video-to-gif"
   | "history"
   | "settings";
 
@@ -41,6 +43,7 @@ export const navigationItems: NavigationItem[] = [
   { id: "convert-video", label: "Convert Video", icon: RefreshCw, group: "workspace" },
   { id: "extract-audio", label: "Extract Audio", icon: FileAudio2, group: "workspace" },
   { id: "trim-video", label: "Trim Video", icon: Clapperboard, group: "workspace" },
+  { id: "video-to-gif", label: "Video to GIF", icon: Images, group: "workspace" },
   { id: "history", label: "Processing History", icon: Clock3, group: "account" },
   { id: "settings", label: "Settings", icon: Settings2, group: "account" },
 ];

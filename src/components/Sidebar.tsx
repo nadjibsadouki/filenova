@@ -21,6 +21,8 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
         ? t("extractAudioNav")
         : item.id === "trim-video"
           ? t("trimVideoNav")
+        : item.id === "video-to-gif"
+          ? t("videoGifNav")
         : item.label;
     return (
       <button
