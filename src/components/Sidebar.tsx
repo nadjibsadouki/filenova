@@ -23,6 +23,8 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           ? t("trimVideoNav")
         : item.id === "video-to-gif"
           ? t("videoGifNav")
+        : item.id === "social-media-tools"
+          ? t("socialNav")
         : item.label;
     return (
       <button

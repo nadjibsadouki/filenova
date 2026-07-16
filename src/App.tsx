@@ -12,6 +12,7 @@ import { ConvertVideoPage } from "./pages/ConvertVideoPage";
 import { ExtractAudioPage } from "./pages/ExtractAudioPage";
 import { TrimVideoPage } from "./pages/TrimVideoPage";
 import { VideoToGifPage } from "./pages/VideoToGifPage";
+import { SocialMediaToolsPage } from "./pages/SocialMediaToolsPage";
 
 function App() {
   const [activePage, setActivePage] = useState<PageId>("home");
@@ -41,6 +42,8 @@ function App() {
           <TrimVideoPage />
         ) : activePage === "video-to-gif" ? (
           <VideoToGifPage />
+        ) : activePage === "social-media-tools" ? (
+          <SocialMediaToolsPage />
         ) : (
           <PlaceholderPage page={currentPage} />
         )}

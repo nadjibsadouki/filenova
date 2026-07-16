@@ -8,6 +8,8 @@ mod pdf_organize;
 mod pdf_split;
 mod pdf_to_images;
 mod resizing;
+#[allow(dead_code)]
+mod social_media_plan;
 mod trim_video;
 #[allow(dead_code)]
 mod trim_video_plan;

@@ -4,6 +4,7 @@ import {
   FileText,
   FileAudio2,
   Images,
+  Share2,
   House,
   ImageDown,
   RefreshCw,
@@ -23,6 +24,7 @@ export type PageId =
   | "extract-audio"
   | "trim-video"
   | "video-to-gif"
+  | "social-media-tools"
   | "history"
   | "settings";
 
@@ -44,6 +46,7 @@ export const navigationItems: NavigationItem[] = [
   { id: "extract-audio", label: "Extract Audio", icon: FileAudio2, group: "workspace" },
   { id: "trim-video", label: "Trim Video", icon: Clapperboard, group: "workspace" },
   { id: "video-to-gif", label: "Video to GIF", icon: Images, group: "workspace" },
+  { id: "social-media-tools", label: "Social Media Tools", icon: Share2, group: "workspace" },
   { id: "history", label: "Processing History", icon: Clock3, group: "account" },
   { id: "settings", label: "Settings", icon: Settings2, group: "account" },
 ];
