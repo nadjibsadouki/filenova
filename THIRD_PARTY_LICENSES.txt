@@ -87,3 +87,19 @@ permitted under LGPL-3.0-or-later provided its notice, source-availability,
 replacement/relinking, and reverse-engineering requirements are honored.
 Codec patent obligations are separate and depend on the formats used and the
 jurisdictions where FileNova is distributed.
+
+FileNova 0.2.0 application shell and interface
+-----------------------------------------------
+The notices above remain applicable to the native PDF and media components
+bundled with FileNova 0.2.0. The release also uses these direct interface and
+desktop-shell packages, as recorded in package-lock.json:
+
+- Tauri JavaScript API 2.11.1: Apache-2.0 OR MIT
+- Tauri dialog plugin 2.7.1: MIT OR Apache-2.0
+- Tauri opener plugin 2.5.4: MIT OR Apache-2.0
+- React and React DOM 19.2.7: MIT
+- Lucide React 1.24.0: ISC
+
+Their source repositories and complete package metadata are recorded in the
+corresponding installed packages and lockfiles. This update does not replace or
+remove any notice for PDFium, FFmpeg, FFprobe, or their bundled components.

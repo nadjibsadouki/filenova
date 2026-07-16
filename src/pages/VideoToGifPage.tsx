@@ -22,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
+import type { VideoToolRuntimeChange } from "../navigation";
 import {
   calculateGifDimensions,
   estimateGif,
@@ -106,7 +107,9 @@ function gifErrorKey(reason: unknown): TranslationKey | null {
   return keys[code] ?? null;
 }
 
-export function VideoToGifPage() {
+interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeChange }
+
+export function VideoToGifPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [status, setStatus] = useState<"idle" | "analyzing" | "ready" | "failed">("idle");
@@ -165,6 +168,7 @@ export function VideoToGifPage() {
   }, []);
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let cleanup: (() => void) | undefined;
     getCurrentWebview().onDragDropEvent((event) => {
@@ -173,7 +177,7 @@ export function VideoToGifPage() {
       if (disposed) unlisten(); else cleanup = unlisten;
     });
     return () => { disposed = true; cleanup?.(); };
-  }, [loadVideo]);
+  }, [active, loadVideo]);
 
   useEffect(() => {
     let disposed = false;
@@ -302,6 +306,8 @@ export function VideoToGifPage() {
       setCreationError(key ? t(key) : errorMessage(reason));
     }
   }
+
+  useEffect(() => { onRuntimeChange?.("video-to-gif", isCreating, cancelGif); }, [isCreating, onRuntimeChange]);
 
   async function openPath(path: string) {
     try {

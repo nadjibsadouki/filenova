@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
+import type { VideoToolRuntimeChange } from "../navigation";
 import {
   chooseTargetResolution,
   calculateTargetBitrates,
@@ -212,7 +213,9 @@ function thumbnailUrl(data: number[] | null) {
   return URL.createObjectURL(new Blob([new Uint8Array(data)], { type: "image/png" }));
 }
 
-export function CompressVideoPage() {
+interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeChange }
+
+export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
   const [items, setItems] = useState<VideoItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
@@ -279,6 +282,7 @@ export function CompressVideoPage() {
   }, [items]);
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
     getCurrentWebview().onDragDropEvent((event) => {
@@ -290,7 +294,7 @@ export function CompressVideoPage() {
       disposed = true;
       unlisten?.();
     };
-  }, [addPaths]);
+  }, [active, addPaths]);
 
   useEffect(() => () => {
     thumbnailUrls.current.forEach((url) => URL.revokeObjectURL(url));
@@ -541,6 +545,8 @@ export function CompressVideoPage() {
       setPageError(parsed.message || t(videoErrorTranslations[parsed.code] ?? "videoCancelFailed"));
     }
   }
+
+  useEffect(() => { onRuntimeChange?.("compress-video", isProcessing, cancelCompression); }, [isProcessing, onRuntimeChange]);
 
   async function deleteResult(item: VideoItem) {
     if (!item.result || isProcessing) return;

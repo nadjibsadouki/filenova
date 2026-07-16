@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
+import type { VideoToolRuntimeChange } from "../navigation";
 
 type OutputFormat = "mp3" | "wav" | "m4a" | "flac" | "ogg";
 type Quality = "low" | "standard" | "high" | "maximum";
@@ -167,7 +168,9 @@ function copyCompatible(format: OutputFormat, codec?: string | null) {
   return value === "OPUS";
 }
 
-export function ExtractAudioPage() {
+interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeChange }
+
+export function ExtractAudioPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
   const [items, setItems] = useState<AudioItem[]>([]);
   const [capabilities, setCapabilities] = useState<AudioCapabilities | null>(null);
@@ -253,6 +256,7 @@ export function ExtractAudioPage() {
   }, []);
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let cleanup: (() => void) | undefined;
     getCurrentWebview().onDragDropEvent((event) => {
@@ -261,7 +265,7 @@ export function ExtractAudioPage() {
       if (disposed) unlisten(); else cleanup = unlisten;
     });
     return () => { disposed = true; cleanup?.(); };
-  }, [addPaths]);
+  }, [active, addPaths]);
 
   useEffect(() => {
     let disposed = false;
@@ -410,6 +414,8 @@ export function ExtractAudioPage() {
       setNotice(parsed.message || t("extractAudioCancelFailed"));
     }
   }
+
+  useEffect(() => { onRuntimeChange?.("extract-audio", isProcessing, cancelExtraction); }, [isProcessing, onRuntimeChange]);
 
   return <div className="page extract-audio-page">
     <header className="page-header compression-header video-header">

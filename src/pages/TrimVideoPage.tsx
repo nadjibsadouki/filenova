@@ -24,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
+import type { VideoToolRuntimeChange } from "../navigation";
 
 type OutputFormat = "mp4" | "mov" | "mkv" | "webm";
 type CutMode = "fast" | "precise";
@@ -175,7 +176,9 @@ function ResultActions({ result, t, onPreview }: {
   return <><div className="video-result-location"><FolderOpen size={13} /><span title={result.outputPath}>{result.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={onPreview}><Play size={13} />{t("previewVideo")}</button><button className="text-button" type="button" onClick={() => void openPath(result.outputPath)}><Video size={13} />{t("openVideo")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(result.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></>;
 }
 
-export function TrimVideoPage() {
+interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeChange }
+
+export function TrimVideoPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [status, setStatus] = useState<"idle" | "analyzing" | "ready" | "failed">("idle");
@@ -232,6 +235,7 @@ export function TrimVideoPage() {
   }, []);
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let cleanup: (() => void) | undefined;
     getCurrentWebview().onDragDropEvent((event) => {
@@ -240,7 +244,7 @@ export function TrimVideoPage() {
       if (disposed) unlisten(); else cleanup = unlisten;
     });
     return () => { disposed = true; cleanup?.(); };
-  }, [loadVideo]);
+  }, [active, loadVideo]);
 
   useEffect(() => {
     let disposed = false;
@@ -431,6 +435,8 @@ export function TrimVideoPage() {
       setRunError(fastTrimErrors[code] ?? "trimCancelFailed");
     }
   }
+
+  useEffect(() => { onRuntimeChange?.("trim-video", isProcessing, cancelActiveCut); }, [isProcessing, onRuntimeChange]);
 
   return <div className="page trim-video-page">
     <header className="page-header compression-header video-header">

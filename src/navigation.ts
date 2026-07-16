@@ -20,6 +20,7 @@ export type PageId =
   | "resize-images"
   | "pdf-tools"
   | "video-tools"
+  | "compress-video"
   | "convert-video"
   | "extract-audio"
   | "trim-video"
@@ -42,11 +43,34 @@ export const navigationItems: NavigationItem[] = [
   { id: "resize-images", label: "Resize Images", icon: Scaling, group: "workspace" },
   { id: "pdf-tools", label: "PDF Tools", icon: FileText, group: "workspace" },
   { id: "video-tools", label: "Video Tools", icon: Clapperboard, group: "workspace" },
-  { id: "convert-video", label: "Convert Video", icon: RefreshCw, group: "workspace" },
-  { id: "extract-audio", label: "Extract Audio", icon: FileAudio2, group: "workspace" },
-  { id: "trim-video", label: "Trim Video", icon: Clapperboard, group: "workspace" },
-  { id: "video-to-gif", label: "Video to GIF", icon: Images, group: "workspace" },
-  { id: "social-media-tools", label: "Social Media Tools", icon: Share2, group: "workspace" },
   { id: "history", label: "Processing History", icon: Clock3, group: "account" },
   { id: "settings", label: "Settings", icon: Settings2, group: "account" },
 ];
+
+export type VideoToolPageId = Extract<PageId,
+  | "compress-video"
+  | "convert-video"
+  | "extract-audio"
+  | "trim-video"
+  | "video-to-gif"
+  | "social-media-tools"
+>;
+
+export const videoToolItems: Array<{ id: VideoToolPageId; icon: LucideIcon }> = [
+  { id: "compress-video", icon: Clapperboard },
+  { id: "convert-video", icon: RefreshCw },
+  { id: "extract-audio", icon: FileAudio2 },
+  { id: "trim-video", icon: Clapperboard },
+  { id: "video-to-gif", icon: Images },
+  { id: "social-media-tools", icon: Share2 },
+];
+
+export const isVideoToolPage = (page: PageId): page is VideoToolPageId => (
+  videoToolItems.some((item) => item.id === page)
+);
+
+export type VideoToolRuntimeChange = (
+  page: VideoToolPageId,
+  processing: boolean,
+  cancel: () => Promise<void>,
+) => void;

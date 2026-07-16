@@ -23,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
+import type { VideoToolRuntimeChange } from "../navigation";
 
 type OutputFormat = "mp4" | "webm" | "mov" | "mkv";
 type VideoCodec = "auto" | "openh264" | "svtAv1" | "copy";
@@ -196,7 +197,9 @@ function audioCopySupported(format: OutputFormat, codec?: string | null) {
   return value !== "UNKNOWN";
 }
 
-export function ConvertVideoPage() {
+interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeChange }
+
+export function ConvertVideoPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
   const [items, setItems] = useState<VideoItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
@@ -287,13 +290,14 @@ export function ConvertVideoPage() {
   }, [items]);
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let cleanup: (() => void) | undefined;
     getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "drop") void addPaths(event.payload.paths);
     }).then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
     return () => { disposed = true; cleanup?.(); };
-  }, [addPaths]);
+  }, [active, addPaths]);
 
   useEffect(() => () => {
     urls.current.forEach(URL.revokeObjectURL);
@@ -447,6 +451,8 @@ export function ConvertVideoPage() {
       setNotice(parsed.message || t("convertCancelFailed"));
     }
   }
+
+  useEffect(() => { onRuntimeChange?.("convert-video", isProcessing, cancelConversion); }, [isProcessing, onRuntimeChange]);
 
   return <div className="page convert-video-page">
     <header className="page-header compression-header video-header">

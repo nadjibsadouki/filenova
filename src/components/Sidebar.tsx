@@ -1,5 +1,5 @@
 import { LockKeyhole } from "lucide-react";
-import { navigationItems, type PageId } from "../navigation";
+import { isVideoToolPage, navigationItems, type PageId } from "../navigation";
 import { Brand } from "./Brand";
 import { useI18n } from "../i18n";
 
@@ -15,24 +15,15 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
   const renderItem = (item: (typeof navigationItems)[number]) => {
     const Icon = item.icon;
-    const label = item.id === "convert-video"
-      ? t("convertVideoNav")
-      : item.id === "extract-audio"
-        ? t("extractAudioNav")
-        : item.id === "trim-video"
-          ? t("trimVideoNav")
-        : item.id === "video-to-gif"
-          ? t("videoGifNav")
-        : item.id === "social-media-tools"
-          ? t("socialNav")
-        : item.label;
+    const label = item.id === "video-tools" ? t("videoToolsNav") : item.label;
+    const selected = activePage === item.id || (item.id === "video-tools" && isVideoToolPage(activePage));
     return (
       <button
-        className={`nav-item${activePage === item.id ? " active" : ""}`}
+        className={`nav-item${selected ? " active" : ""}`}
         key={item.id}
         onClick={() => onNavigate(item.id)}
         type="button"
-        aria-current={activePage === item.id ? "page" : undefined}
+        aria-current={selected ? "page" : undefined}
         title={label}
       >
         <Icon size={19} strokeWidth={1.8} />

@@ -3,6 +3,8 @@ mod audio_extraction_plan;
 mod compression;
 mod conversion;
 mod images_pdf;
+#[cfg(test)]
+mod navigation_contract;
 mod pdf_merge;
 mod pdf_organize;
 mod pdf_split;

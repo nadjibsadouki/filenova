@@ -6,6 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { AlertTriangle, Ban, Check, CheckCircle2, Clapperboard, Crop, FileVideo2, FolderOpen, Grid3X3, Play, Settings2, Trash2, UploadCloud, Video, X } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
+import type { VideoToolRuntimeChange } from "../navigation";
 import {
   customObjectPosition,
   plannedCrop,
@@ -95,7 +96,9 @@ function platformKey(platform: SocialPlatform): TranslationKey {
   return keys[platform];
 }
 
-export function SocialMediaToolsPage() {
+interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeChange }
+
+export function SocialMediaToolsPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [status, setStatus] = useState<"idle" | "analyzing" | "ready" | "failed">("idle");
@@ -155,6 +158,7 @@ export function SocialMediaToolsPage() {
   }, [video?.path, platform, presetId]);
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let cleanup: (() => void) | undefined;
     listen<SocialExportProgress>("social-media-export-progress", (event) => {
@@ -171,7 +175,7 @@ export function SocialMediaToolsPage() {
       if (event.payload.type === "drop") void loadVideo(event.payload.paths.slice(0, 1));
     }).then((unlisten) => { if (disposed) unlisten(); else cleanup = unlisten; });
     return () => { disposed = true; cleanup?.(); };
-  }, [loadVideo]);
+  }, [active, loadVideo]);
 
   const availablePresets = socialPresets.filter((preset) => preset.platform === platform);
   const selectedPreset = socialPresets.find((preset) => preset.id === presetId);
@@ -277,6 +281,8 @@ export function SocialMediaToolsPage() {
       setExportError(message || t("socialCancelFailed"));
     }
   }
+
+  useEffect(() => { onRuntimeChange?.("social-media-tools", isExporting, cancelExport); }, [isExporting, onRuntimeChange]);
 
   async function openExportedVideo(path: string) {
     try {
