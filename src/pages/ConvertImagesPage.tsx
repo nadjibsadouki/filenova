@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { useSettings } from "../settings";
+import { appendProcessingHistoryEntry, appendProcessingHistoryEntries } from "../history";
 import {
   AlertTriangle, Check, CheckCircle2, CircleGauge, FileImage, FolderOpen, ImagePlus,
   Images, LoaderCircle, MapPin, RefreshCw, ShieldCheck, Square, Trash2, UploadCloud, X,
@@ -58,6 +60,7 @@ function parseError(error: unknown) {
 
 export function ConvertImagesPage() {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [items, setItems] = useState<ConvertItem[]>([]);
   const [targetFormat, setTargetFormat] = useState<OutputFormat>("webp");
   const [destination, setDestination] = useState<string | null>(null);
@@ -122,12 +125,28 @@ export function ConvertImagesPage() {
 
     for (let index = 0; index < queue.length; index += 1) {
       if (cancelRequested.current) {
+        const cancelled = queue.slice(index).map((item) => ({
+          id: crypto.randomUUID?.() ?? `history-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          datetime: new Date().toISOString(),
+          category: "Image",
+          tool: t("convertImages"),
+          sourceFileName: item.name,
+          createdFileName: "",
+          createdFilePath: "",
+          status: "Cancelled" as const,
+          originalSize: item.size,
+          finalSize: 0,
+          durationMs: 0,
+          errorMessage: undefined,
+        }));
+        void appendProcessingHistoryEntries(cancelled, settings.enableProcessingHistory);
         const remaining = new Set(queue.slice(index).map((item) => item.path));
         setItems((current) => current.map((item) => remaining.has(item.path) ? { ...item, status: "cancelled", progress: 0 } : item));
         break;
       }
       const item = queue[index];
       setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, status: "processing", progress: 35 } : entry));
+      const startTime = Date.now();
       let result: ConvertResult;
       try {
         result = await invoke<ConvertResult>("convert_image", { request: {
@@ -139,6 +158,21 @@ export function ConvertImagesPage() {
         const parsed = parseError(error);
         result = { success: false, targetFormat: targetFormat.toUpperCase(), originalSize: item.size, errorCode: parsed.code, errorMessage: parsed.message };
       }
+      const durationMs = Date.now() - startTime;
+      void appendProcessingHistoryEntry({
+        id: crypto.randomUUID?.() ?? `history-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        datetime: new Date().toISOString(),
+        category: "Image",
+        tool: t("convertImages"),
+        sourceFileName: item.name,
+        createdFileName: result.outputPath ? result.outputPath.split(/[\\/]/).pop() ?? "" : "",
+        createdFilePath: result.outputPath ?? "",
+        status: result.success ? "Completed" as const : "Failed" as const,
+        originalSize: result.originalSize,
+        finalSize: result.newSize,
+        durationMs,
+        errorMessage: result.errorMessage,
+      }, settings.enableProcessingHistory);
       setItems((current) => current.map((entry) => entry.path === item.path ? {
         ...entry, status: result.success ? "completed" : "failed", progress: 100, result,
         errorCode: result.errorCode, errorMessage: result.errorMessage,

@@ -8,6 +8,7 @@ import { CompressImagesPage } from "./pages/CompressImagesPage";
 import { ConvertImagesPage } from "./pages/ConvertImagesPage";
 import { ResizeImagesPage } from "./pages/ResizeImagesPage";
 import { PdfToolsPage } from "./pages/PdfToolsPage";
+import { ProcessingHistoryPage } from "./pages/ProcessingHistoryPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { CompressVideoPage } from "./pages/CompressVideoPage";
 import { ConvertVideoPage } from "./pages/ConvertVideoPage";
@@ -66,6 +67,8 @@ function App() {
           <ResizeImagesPage />
         ) : activePage === "pdf-tools" ? (
           <PdfToolsPage />
+        ) : activePage === "history" ? (
+          <ProcessingHistoryPage />
         ) : activePage === "settings" ? (
           <SettingsPage />
         ) : activePage === "video-tools" || isVideoToolPage(activePage) ? null

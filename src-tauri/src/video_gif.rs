@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -303,9 +304,18 @@ fn create_gif_with_tools(
     }
     fs::rename(&temporary_gif, &final_output)
         .map_err(|error| CreateGifError::new("destination_inaccessible", error.to_string()))?;
+
+    // Windows peut exposer une fenêtre de temps où le fichier renommé n'est pas encore
+    // parfaitement stable côté système de fichiers. Certaines lectures immédiates via
+    // ffprobe/ffmpeg (surtout quand la suite de tests est chargée) peuvent alors échouer
+    // ou produire des métadonnées incohérentes.
+    // On applique une petite "fence" de stabilité IO avant de quitter la fonction.
+    let _ = wait_for_file_stability(&final_output);
+
     cleanup.0.retain(|path| path != &temporary_gif);
 
     Ok(CreateGifResult {
+
         output_path: final_output.to_string_lossy().into_owned(),
         output_name: final_output
             .file_name()
@@ -696,8 +706,26 @@ fn report_progress_line(
     });
 }
 
+fn wait_for_file_stability(path: &Path) -> Result<(), CreateGifError> {
+    // Attend quelques itérations en vérifiant que la taille du fichier ne change pas.
+    // Objectif: rendre la lecture de ffprobe/ffmpeg plus fiable sur Windows.
+    let mut last_size = None;
+    for _ in 0..50 {
+        if let Ok(meta) = fs::metadata(path) {
+            let size = meta.len();
+            if last_size == Some(size) {
+                return Ok(());
+            }
+            last_size = Some(size);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 fn validate_gif_output(
     path: &Path,
+
     ffprobe: &Path,
     library_dir: &Path,
     expected_width: u64,

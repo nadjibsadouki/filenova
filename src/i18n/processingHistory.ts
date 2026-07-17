@@ -1,0 +1,1 @@
+// Placeholder: this file is not imported directly. Translations are in existing language dictionaries.

@@ -1,0 +1,61 @@
+FileNova third-party notices
+============================
+
+This file records the native PDF rendering components distributed with FileNova.
+None of these components requires an AGPL or commercial license. The complete
+license texts supplied with the pinned PDFium binary are bundled in
+pdfium/licenses/ alongside pdfium.dll.
+
+PDFium 148.0.7763.0
+-------------------
+Copyright 2014 The PDFium Authors.
+License: BSD 3-Clause and Apache License 2.0 notices, as distributed by PDFium.
+Source: https://pdfium.googlesource.com/pdfium/
+Binary API build: chromium/7763.
+
+The bundled PDFium build contains permissively licensed components whose exact
+notices are included in pdfium/licenses/: Abseil, Anti-Grain Geometry 2.3,
+fast_float, FreeType (used under the FreeType License), ICU, Little CMS,
+libjpeg-turbo, OpenJPEG, libpng, libtiff, LLVM libc, simdutf, and zlib.
+
+pdfium-render 0.9.2
+-------------------
+Copyright Alastair Carey and pdfium-render contributors.
+License: MIT OR Apache-2.0 (FileNova uses the Apache-2.0 option).
+Source: https://github.com/ajrcarey/pdfium-render
+
+pdfium-binaries
+---------------
+Copyright 2014-2025 Benoit Blanchon.
+License: MIT.
+Source: https://github.com/bblanchon/pdfium-binaries
+Pinned archive: pdfium-win-x64.tgz from immutable release chromium/7763.
+Archive SHA-256: 45C4CC5D052EF8EC6380B946B548A76100F4675E38362000A4C732E16D5E8EDA
+Bundled pdfium.dll SHA-256: A63949DC46A7314BBA619AC6CC1B3849627E137F542AE31B2B36B302841F77AE
+
+The original pdfium-binaries MIT license is bundled as pdfium/LICENSE.
+
+Rust rendering and image encoding dependency audit
+--------------------------------------------------
+The Cargo.lock dependency graph was audited on 2026-07-14. The direct runtime
+chain added for PDF rendering and output encoding has these declared licenses:
+
+- pdfium-render 0.9.2: MIT OR Apache-2.0
+- bitflags: MIT OR Apache-2.0
+- bytemuck: Zlib OR Apache-2.0 OR MIT
+- bytes: MIT
+- chrono: MIT OR Apache-2.0
+- either: MIT OR Apache-2.0
+- image 0.25: MIT OR Apache-2.0
+- itertools: MIT OR Apache-2.0
+- libloading: ISC
+- maybe-owned: MIT OR Apache-2.0
+- once_cell: MIT OR Apache-2.0
+- piston-float: MIT
+- utf16string: MIT OR Apache-2.0
+- vecmath: MIT
+- webp: MIT OR Apache-2.0
+
+No AGPL dependency and no dependency requiring a commercial runtime license was
+found. The full pdfium-render dual-license text is bundled as
+pdfium/licenses/pdfium-render.md.

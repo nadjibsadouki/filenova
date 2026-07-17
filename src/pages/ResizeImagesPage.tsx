@@ -3,6 +3,8 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { useSettings } from "../settings";
+import { appendProcessingHistoryEntry, appendProcessingHistoryEntries } from "../history";
 import {
   AlertTriangle,
   Check,
@@ -126,6 +128,7 @@ function formatBytes(value: number) {
 
 export function ResizeImagesPage() {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [items, setItems] = useState<ResizeItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
   const [mode, setMode] = useState<ResizeMode>("exact");
@@ -303,6 +306,21 @@ export function ResizeImagesPage() {
 
     for (let index = 0; index < queue.length; index += 1) {
       if (cancelRequested.current) {
+        const cancelled = queue.slice(index).map((item) => ({
+          id: crypto.randomUUID?.() ?? `history-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          datetime: new Date().toISOString(),
+          category: "Image",
+          tool: t("resizeImages"),
+          sourceFileName: item.name,
+          createdFileName: "",
+          createdFilePath: "",
+          status: "Cancelled" as const,
+          originalSize: item.size,
+          finalSize: 0,
+          durationMs: 0,
+          errorMessage: undefined,
+        }));
+        void appendProcessingHistoryEntries(cancelled, settings.enableProcessingHistory);
         const remaining = new Set(queue.slice(index).map((item) => item.path));
         setItems((current) => current.map((entry) => remaining.has(entry.path) ? { ...entry, status: "cancelled" } : entry));
         break;
@@ -310,6 +328,7 @@ export function ResizeImagesPage() {
       const item = queue[index];
       const estimate = estimatedDimensions.get(item.path)!;
       setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, status: "processing" } : entry));
+      const startTime = Date.now();
 
       let result: ResizeResult;
       try {
@@ -344,6 +363,21 @@ export function ResizeImagesPage() {
           errorMessage: parsed.message,
         };
       }
+      const durationMs = Date.now() - startTime;
+      void appendProcessingHistoryEntry({
+        id: crypto.randomUUID?.() ?? `history-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        datetime: new Date().toISOString(),
+        category: "Image",
+        tool: t("resizeImages"),
+        sourceFileName: item.name,
+        createdFileName: result.outputPath ? result.outputPath.split(/[\\/]/).pop() ?? "" : "",
+        createdFilePath: result.outputPath ?? "",
+        status: result.success ? "Completed" as const : "Failed" as const,
+        originalSize: result.originalSize,
+        finalSize: result.newSize,
+        durationMs,
+        errorMessage: result.errorMessage,
+      }, settings.enableProcessingHistory);
 
       setItems((current) => current.map((entry) => entry.path === item.path ? {
         ...entry,

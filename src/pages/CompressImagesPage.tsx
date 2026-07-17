@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { useSettings } from "../settings";
+import { appendProcessingHistoryEntry } from "../history";
 import {
   AlertCircle, Check, CheckCircle2, ChevronRight, CircleGauge, FolderOpen,
   HardDrive, ImagePlus, Images, LoaderCircle, MapPin, ShieldCheck, Trash2, UploadCloud,
@@ -80,6 +82,7 @@ function commandError(error: unknown): { code: string; message?: string } {
 
 export function CompressImagesPage() {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [items, setItems] = useState<ImageItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
   const [saveInNewFolder, setSaveInNewFolder] = useState(true);
@@ -151,6 +154,7 @@ export function CompressImagesPage() {
     for (let index = 0; index < queue.length; index += 1) {
       const item = queue[index];
       setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, status: "processing" } : entry));
+      const startTime = Date.now();
       let result: CompressionResult;
       try {
         result = await invoke<CompressionResult>("compress_image", {
@@ -167,6 +171,22 @@ export function CompressImagesPage() {
         const parsed = commandError(error);
         result = { success: false, originalSize: item.size, errorCode: parsed.code, errorMessage: parsed.message };
       }
+      const durationMs = Date.now() - startTime;
+      const status = result.success ? "Completed" as const : "Failed" as const;
+      void appendProcessingHistoryEntry({
+        id: crypto.randomUUID?.() ?? `history-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        datetime: new Date().toISOString(),
+        category: "Image",
+        tool: t("compressImages"),
+        sourceFileName: item.name,
+        createdFileName: result.outputPath ? fileNameFromPath(result.outputPath) : "",
+        createdFilePath: result.outputPath ?? "",
+        status,
+        originalSize: result.originalSize,
+        finalSize: result.newSize,
+        durationMs,
+        errorMessage: result.errorMessage,
+      }, settings.enableProcessingHistory);
       setItems((current) => current.map((entry) => entry.path === item.path ? {
         ...entry,
         status: result.success ? (result.warningCode ? "warning" : "completed") : "failed",
