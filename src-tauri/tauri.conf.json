@@ -36,7 +36,8 @@
     "resources": {
       "resources/pdfium/": "pdfium/",
       "resources/ffmpeg/": "ffmpeg/",
-      "../THIRD_PARTY_LICENSES.txt": "THIRD_PARTY_LICENSES.txt"
+      "../THIRD_PARTY_LICENSES.txt": "THIRD_PARTY_LICENSES.txt",
+      "../README.md": "README.md"
     },
     "icon": [
       "icons/32x32.png",

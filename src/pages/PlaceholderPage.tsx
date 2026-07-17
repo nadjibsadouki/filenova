@@ -1,4 +1,4 @@
-import { ArrowLeft, Sparkles } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import type { NavigationItem } from "../navigation";
 
 interface PlaceholderPageProps {
@@ -19,9 +19,8 @@ export function PlaceholderPage({ page }: PlaceholderPageProps) {
       </header>
       <section className="coming-soon">
         <div className="coming-icon"><Icon size={32} strokeWidth={1.6} /></div>
-        <span className="coming-label"><Sparkles size={14} /> In development</span>
         <h2>{page.label}</h2>
-        <p>Coming in the next development step</p>
+        <p>This section is unavailable in FileNova 0.2.0.</p>
         <div className="coming-hint"><ArrowLeft size={15} /> Select Home from the sidebar to return</div>
       </section>
     </div>

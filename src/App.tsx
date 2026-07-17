@@ -16,6 +16,7 @@ import { TrimVideoPage } from "./pages/TrimVideoPage";
 import { VideoToGifPage } from "./pages/VideoToGifPage";
 import { SocialMediaToolsPage } from "./pages/SocialMediaToolsPage";
 import { VideoToolsPage } from "./pages/VideoToolsPage";
+import { SettingsPage } from "./pages/SettingsPage";
 
 function App() {
   const { t } = useI18n();
@@ -65,6 +66,8 @@ function App() {
           <ResizeImagesPage />
         ) : activePage === "pdf-tools" ? (
           <PdfToolsPage />
+        ) : activePage === "settings" ? (
+          <SettingsPage />
         ) : activePage === "video-tools" || isVideoToolPage(activePage) ? null
         : currentPage ? (
           <PlaceholderPage page={currentPage} />

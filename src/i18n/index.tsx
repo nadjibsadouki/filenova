@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, type ReactNode } from "react";
+import { useSettings } from "../settings";
 import { ar } from "./ar";
 import { en } from "./en";
 import { fr } from "./fr";
@@ -16,25 +17,22 @@ interface I18nValue {
 const I18nContext = createContext<I18nValue | null>(null);
 
 export function I18nProvider({ children }: { children: ReactNode }) {
-  const [language, setLanguage] = useState<Language>(() => {
-    const saved = localStorage.getItem("filenova-language");
-    return saved === "fr" || saved === "ar" ? saved : "en";
-  });
+  const { settings, updateSettings } = useSettings();
+  const language = settings.language;
 
   useEffect(() => {
-    localStorage.setItem("filenova-language", language);
     document.documentElement.lang = language;
     document.documentElement.dir = language === "ar" ? "rtl" : "ltr";
   }, [language]);
 
   const value = useMemo<I18nValue>(() => ({
     language,
-    setLanguage,
+    setLanguage: (next) => updateSettings({ language: next }),
     t: (key, variables = {}) => Object.entries(variables).reduce(
       (text, [name, value]) => text.split(`{${name}}`).join(String(value)),
       dictionaries[language][key],
     ),
-  }), [language]);
+  }), [language, updateSettings]);
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }

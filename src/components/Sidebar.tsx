@@ -15,7 +15,8 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
   const renderItem = (item: (typeof navigationItems)[number]) => {
     const Icon = item.icon;
-    const label = item.id === "video-tools" ? t("videoToolsNav") : item.label;
+    const labelKeys = { home: "navHome", "compress-images": "navCompressImages", "convert-images": "navConvertImages", "resize-images": "navResizeImages", "pdf-tools": "navPdfTools", "video-tools": "videoToolsNav", history: "navHistory", settings: "navSettings" } as const;
+    const label = item.id in labelKeys ? t(labelKeys[item.id as keyof typeof labelKeys]) : item.label;
     const selected = activePage === item.id || (item.id === "video-tools" && isVideoToolPage(activePage));
     return (
       <button
@@ -36,7 +37,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
     <aside className="sidebar">
       <div className="sidebar-brand">
         <Brand />
-        <p>Your files. Your privacy. Your control.</p>
+        <p>{t("sidebarTagline")}</p>
       </div>
 
       <nav className="navigation" aria-label="Main navigation">
@@ -47,7 +48,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
       <div className="privacy-badge">
         <span className="privacy-icon"><LockKeyhole size={15} /></span>
-        <span><strong>100% Offline</strong><small>&amp; Private</small></span>
+        <span><strong>{t("offlinePrivate")}</strong><small>{t("privateLabel")}</small></span>
       </div>
     </aside>
   );

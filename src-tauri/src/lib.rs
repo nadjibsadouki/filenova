@@ -10,6 +10,7 @@ mod pdf_organize;
 mod pdf_split;
 mod pdf_to_images;
 mod resizing;
+mod settings;
 mod social_media_export;
 #[allow(dead_code)]
 mod social_media_plan;
@@ -38,6 +39,7 @@ use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
 use pdf_to_images::{inspect_pdf_for_images, pdf_to_images, validate_pdf_image_output};
 use resizing::resize_image;
+use settings::{get_runtime_status, get_support_document_path, load_settings, save_settings};
 use social_media_export::{
     cancel_social_media_export, export_social_media_video, SocialExportState,
 };
@@ -85,6 +87,10 @@ pub fn run() {
             pdf_to_images,
             validate_pdf_image_output,
             inspect_video,
+            load_settings,
+            save_settings,
+            get_runtime_status,
+            get_support_document_path,
             compress_recommended_video,
             cancel_video_compression,
             delete_video_result,
