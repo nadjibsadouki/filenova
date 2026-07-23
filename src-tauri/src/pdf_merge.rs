@@ -244,6 +244,16 @@ fn create_unique_file(directory: &Path, stem: &str, bytes: &[u8]) -> Result<Path
     ))
 }
 
+fn output_size_with_cleanup<F>(path: &Path, metadata_len: F) -> Result<u64, PdfError>
+where
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
+    metadata_len(path).map_err(|err| {
+        let _ = fs::remove_file(path);
+        error("write_error", err.to_string())
+    })
+}
+
 fn merge_pdfs_sync(request: MergePdfRequest) -> Result<MergePdfResult, PdfError> {
     if request.paths.len() < 2 {
         return Err(error("not_enough_pdfs", "Select at least two PDF files"));
@@ -277,9 +287,9 @@ fn merge_pdfs_sync(request: MergePdfRequest) -> Result<MergePdfResult, PdfError>
         .save_to(&mut bytes)
         .map_err(|err| error("write_error", err.to_string()))?;
     let output_path = create_unique_file(&destination, &safe_stem(&request.output_name), &bytes)?;
-    let new_size = fs::metadata(&output_path)
-        .map_err(|err| error("write_error", err.to_string()))?
-        .len();
+    let new_size = output_size_with_cleanup(&output_path, |path| {
+        fs::metadata(path).map(|metadata| metadata.len())
+    })?;
     Ok(MergePdfResult {
         success: true,
         pdf_count: request.paths.len(),
@@ -438,5 +448,20 @@ mod tests {
             .code,
             "not_enough_pdfs"
         );
+    }
+
+    #[test]
+    fn removes_output_when_metadata_read_fails() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("merged.pdf");
+        fs::write(&output, b"complete output").unwrap();
+        let result = output_size_with_cleanup(&output, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "metadata failure",
+            ))
+        });
+        assert_eq!(result.unwrap_err().code, "write_error");
+        assert!(!output.exists());
     }
 }

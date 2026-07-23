@@ -218,6 +218,16 @@ fn write_unique(
     Err(error("write_error", "Unable to create a unique filename"))
 }
 
+fn output_size_with_cleanup<F>(path: &Path, metadata_len: F) -> Result<u64, OrganizeError>
+where
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
+    metadata_len(path).map_err(|err| {
+        let _ = fs::remove_file(path);
+        error("read_error", err.to_string())
+    })
+}
+
 fn organize_pdf_sync(request: OrganizePdfRequest) -> Result<OrganizePdfResult, OrganizeError> {
     let source_path = PathBuf::from(&request.path);
     let source = load_pdf(&source_path)?;
@@ -246,9 +256,9 @@ fn organize_pdf_sync(request: OrganizePdfRequest) -> Result<OrganizePdfResult, O
         .save_to(&mut bytes)
         .map_err(|err| error("write_error", err.to_string()))?;
     let output_path = write_unique(&destination, &safe_stem(&request.output_name), &bytes)?;
-    let new_size = fs::metadata(&output_path)
-        .map_err(|err| error("read_error", err.to_string()))?
-        .len();
+    let new_size = output_size_with_cleanup(&output_path, |path| {
+        fs::metadata(path).map(|metadata| metadata.len())
+    })?;
     Ok(OrganizePdfResult {
         success: true,
         initial_pages,
@@ -423,5 +433,20 @@ mod tests {
                 .code,
             "corrupted_pdf"
         );
+    }
+
+    #[test]
+    fn removes_output_when_metadata_read_fails() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("organized.pdf");
+        fs::write(&output, b"complete output").unwrap();
+        let result = output_size_with_cleanup(&output, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "metadata failure",
+            ))
+        });
+        assert_eq!(result.unwrap_err().code, "read_error");
+        assert!(!output.exists());
     }
 }

@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useSettings } from "../settings";
-import { appendProcessingHistoryEntry } from "../history";
+import { appendProcessingHistoryEntry, createImageProcessingHistoryEntry } from "../history";
 import {
   AlertCircle, Check, CheckCircle2, ChevronRight, CircleGauge, FolderOpen,
   HardDrive, ImagePlus, Images, LoaderCircle, MapPin, ShieldCheck, Trash2, UploadCloud,
@@ -172,21 +172,16 @@ export function CompressImagesPage() {
         result = { success: false, originalSize: item.size, errorCode: parsed.code, errorMessage: parsed.message };
       }
       const durationMs = Date.now() - startTime;
-      const status = result.success ? "Completed" as const : "Failed" as const;
-      void appendProcessingHistoryEntry({
-        id: crypto.randomUUID?.() ?? `history-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        datetime: new Date().toISOString(),
-        category: "Image",
-        tool: t("compressImages"),
+      void appendProcessingHistoryEntry(createImageProcessingHistoryEntry({
+        tool: "Compress Images",
         sourceFileName: item.name,
-        createdFileName: result.outputPath ? fileNameFromPath(result.outputPath) : "",
-        createdFilePath: result.outputPath ?? "",
-        status,
+        resultPath: result.outputPath,
+        success: result.success,
         originalSize: result.originalSize,
         finalSize: result.newSize,
         durationMs,
         errorMessage: result.errorMessage,
-      }, settings.enableProcessingHistory);
+      }), settings.enableProcessingHistory);
       setItems((current) => current.map((entry) => entry.path === item.path ? {
         ...entry,
         status: result.success ? (result.warningCode ? "warning" : "completed") : "failed",

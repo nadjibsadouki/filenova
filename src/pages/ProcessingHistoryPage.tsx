@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { Search, Trash2 } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
-import { loadProcessingHistory, type ProcessingHistoryCategory, type ProcessingHistoryEntry, type ProcessingHistoryStatus } from "../history";
+import {
+  clearProcessingHistory,
+  loadProcessingHistory,
+  PROCESSING_HISTORY_CHANGED_EVENT,
+  type ProcessingHistoryCategory,
+  type ProcessingHistoryChangedDetail,
+  type ProcessingHistoryEntry,
+  type ProcessingHistoryStatus,
+} from "../history";
 
 const categories: Array<{ key: "all" | ProcessingHistoryCategory; labelKey: TranslationKey }> = [
   { key: "all", labelKey: "historyFilterAll" },
@@ -41,10 +49,18 @@ export function ProcessingHistoryPage() {
   const [search, setSearch] = useState("");
 
   useEffect(() => {
-    void (async () => {
+    const refresh = async () => {
       const loaded = await loadProcessingHistory();
       setEntries(sortRecentFirst(loaded));
-    })();
+    };
+    const handleHistoryChanged = (event: Event) => {
+      const changed = event as CustomEvent<ProcessingHistoryChangedDetail>;
+      setEntries(sortRecentFirst(changed.detail?.entries ?? []));
+    };
+
+    void refresh();
+    window.addEventListener(PROCESSING_HISTORY_CHANGED_EVENT, handleHistoryChanged);
+    return () => window.removeEventListener(PROCESSING_HISTORY_CHANGED_EVENT, handleHistoryChanged);
   }, []);
 
   const filteredEntries = useMemo(() => {
@@ -68,7 +84,9 @@ export function ProcessingHistoryPage() {
 
       <section className="history-summary">
         <div>{t("historyTotalCount", { count: entries.length })}</div>
-        <button className="text-button" type="button"><Trash2 size={16} />{t("historyClearButton")}</button>
+        <button className="text-button" type="button" onClick={() => void clearProcessingHistory()}>
+          <Trash2 size={16} />{t("historyClearButton")}
+        </button>
       </section>
 
       <section className="history-filters">

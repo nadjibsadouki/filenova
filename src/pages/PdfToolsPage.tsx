@@ -4,6 +4,13 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import {
+  appendProcessingHistoryEntry,
+  appendProcessingHistoryEntries,
+  createPdfProcessingHistoryEntry,
+  type ProcessingHistoryEntry,
+} from "../history";
+import { useSettings } from "../settings";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, CheckCircle2, FileImage, FilePlus2, Files, FolderOpen, GripVertical, ImagePlus, Images, Layers3, ListOrdered, LoaderCircle, MapPin, RotateCcw, RotateCw, Save, Scissors, ShieldCheck, Trash2, Undo2, UploadCloud, X } from "lucide-react";
 import { useI18n, type TranslationKey } from "../i18n";
 
@@ -67,6 +74,7 @@ function bytes(value: number) {
   return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
 }
 function nameFromPath(path: string) { return path.split(/[\\/]/).pop() || path; }
+function joinSourceNames(names: string[]) { return names.join(" • "); }
 function parseError(value: unknown) {
   if (typeof value === "object" && value) return value as { code?: string; message?: string };
   try { return JSON.parse(String(value)) as { code?: string; message?: string }; }
@@ -122,6 +130,7 @@ function validateEveryN(value: string, totalPages: number, stem: string): SplitV
 
 function SplitPdfPanel() {
   const { t } = useI18n();
+  const { settings } = useSettings();
   const [file, setFile] = useState<PdfItem | null>(null);
   const [destination, setDestination] = useState<string | null>(null);
   const [mode, setMode] = useState<SplitMode>("extract");
@@ -182,6 +191,7 @@ function SplitPdfPanel() {
     if (isSplitting) return;
     setIsSplitting(true); setNotice(null); setSplitResult(null);
     setSplitProgress({ completed: 0, total: validation.files.length, percent: 0, currentFile: validation.files[0] ?? "" });
+    const startTime = Date.now();
     try {
       const response = await invoke<SplitResult>("split_pdf", { request: {
         path: file.path, destinationDir: destination, mode,
@@ -189,15 +199,53 @@ function SplitPdfPanel() {
         ranges: mode === "ranges" ? ranges : null,
         everyN: mode === "everyN" ? Number(everyN) : null,
       }});
+      const durationMs = Date.now() - startTime;
       if (response.success) {
+        if (response.files.length > 0) {
+          const entries: ProcessingHistoryEntry[] = response.files.map((output) => createPdfProcessingHistoryEntry({
+            tool: "Split PDF",
+            sourceFileName: file.name,
+            resultPath: output.path,
+            success: true,
+            originalSize: file.size,
+            finalSize: output.size,
+            durationMs,
+          }));
+          void appendProcessingHistoryEntries(entries, settings.enableProcessingHistory);
+        } else {
+          void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+            tool: "Split PDF",
+            sourceFileName: file.name,
+            success: false,
+            originalSize: file.size,
+            durationMs,
+            errorMessage: "Split PDF completed without creating an output file.",
+          }), settings.enableProcessingHistory);
+        }
         setSplitResult(response);
         setSplitProgress({ completed: response.files.length, total: response.files.length, percent: 100, currentFile: "" });
         setNotice(t("splitComplete", { count: response.files.length }));
       } else {
+        void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+          tool: "Split PDF",
+          sourceFileName: file.name,
+          success: false,
+          originalSize: file.size,
+          durationMs,
+          errorMessage: response.errorMessage ?? (response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError", { pages: file.pages }) : t("unknownError")),
+        }), settings.enableProcessingHistory);
         setNotice(response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError", { pages: file.pages }) : response.errorMessage ?? t("unknownError"));
       }
     } catch (error) {
       const parsed = parseError(error);
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "Split PDF",
+        sourceFileName: file.name,
+        success: false,
+        originalSize: file.size,
+        durationMs: Date.now() - startTime,
+        errorMessage: parsed.message ?? (parsed.code ? t(errorKeys[parsed.code] ?? "unknownError", { pages: file.pages }) : t("unknownError")),
+      }), settings.enableProcessingHistory);
       setNotice(parsed.code ? t(errorKeys[parsed.code] ?? "unknownError", { pages: file.pages }) : parsed.message ?? t("unknownError"));
     } finally { setIsSplitting(false); }
   }
@@ -250,6 +298,7 @@ function moveSelectedPages(pages: OrganizePageItem[], selected: Set<number>, dir
 
 function OrganizePagesPanel() {
   const { t } = useI18n();
+  const { settings } = useSettings();
   const [file, setFile] = useState<PdfItem | null>(null);
   const [pages, setPages] = useState<OrganizePageItem[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -341,15 +390,35 @@ function OrganizePagesPanel() {
     if (!outputName.trim()) { setNotice(t("organizeNameRequired")); return; }
     if (isOrganizing) return;
     setIsOrganizing(true); setNotice(null); setResult(null);
+    const startTime = Date.now();
     try {
       const response = await invoke<OrganizeResult>("organize_pdf", { request: {
         path: file.path, destinationDir: destination, outputName,
         pages: pages.map((page) => ({ sourcePage: page.originalPage, rotation: page.rotation })),
       }});
+      const durationMs = Date.now() - startTime;
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "Organize Pages",
+        sourceFileName: file.name,
+        resultPath: response.outputPath,
+        success: response.success,
+        originalSize: file.size,
+        finalSize: response.newSize,
+        durationMs,
+        errorMessage: response.success ? undefined : response.errorMessage ?? (response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError") : t("unknownError")),
+      }), settings.enableProcessingHistory);
       if (response.success) { setResult(response); setNotice(t("organizeComplete")); }
       else setNotice(response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError") : response.errorMessage ?? t("unknownError"));
     } catch (error) {
       const parsed = parseError(error);
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "Organize Pages",
+        sourceFileName: file.name,
+        success: false,
+        originalSize: file.size,
+        durationMs: Date.now() - startTime,
+        errorMessage: parsed.message ?? (parsed.code ? t(errorKeys[parsed.code] ?? "unknownError") : t("unknownError")),
+      }), settings.enableProcessingHistory);
       setNotice(parsed.code ? t(errorKeys[parsed.code] ?? "unknownError") : parsed.message ?? t("unknownError"));
     } finally { setIsOrganizing(false); }
   }
@@ -375,6 +444,7 @@ type PdfImageFitting = "fit" | "fill" | "stretch";
 
 function ImagesToPdfPanel() {
   const { t } = useI18n();
+  const { settings } = useSettings();
   const [items, setItems] = useState<PdfImageItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
   const [outputName, setOutputName] = useState("images-document");
@@ -460,6 +530,9 @@ function ImagesToPdfPanel() {
     if (isCreating) return;
     setIsCreating(true); setNotice(null); setResult(null);
     setProgress({ completed: 0, total: valid.length, percent: 0, currentFile: valid[0].name });
+    const sourceFileName = joinSourceNames(valid.map((item) => item.name));
+    const originalSize = valid.reduce((total, item) => total + item.size, 0);
+    const startTime = Date.now();
     try {
       const response = await invoke<ImagesPdfResult>("images_to_pdf", { request: {
         paths: valid.map((item) => item.path), destinationDir: destination, outputName, pageSize,
@@ -468,10 +541,29 @@ function ImagesToPdfPanel() {
         backgroundColor: background === "white" ? "#ffffff" : background === "black" ? "#000000" : customBackground,
         quality,
       }});
+      const durationMs = Date.now() - startTime;
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "Images to PDF",
+        sourceFileName,
+        resultPath: response.outputPath,
+        success: response.success,
+        originalSize,
+        finalSize: response.newSize,
+        durationMs,
+        errorMessage: response.success ? undefined : response.errorMessage ?? (response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError") : t("unknownError")),
+      }), settings.enableProcessingHistory);
       if (response.success) { setResult(response); setProgress((current) => ({ ...current, completed: response.pageCount, total: response.pageCount, percent: 100 })); setNotice(t("imagesPdfComplete")); }
       else setNotice(response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError") : response.errorMessage ?? t("unknownError"));
     } catch (error) {
       const parsed = parseError(error);
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "Images to PDF",
+        sourceFileName,
+        success: false,
+        originalSize,
+        durationMs: Date.now() - startTime,
+        errorMessage: parsed.message ?? (parsed.code ? t(errorKeys[parsed.code] ?? "unknownError") : t("unknownError")),
+      }), settings.enableProcessingHistory);
       setNotice(parsed.code ? t(errorKeys[parsed.code] ?? "unknownError") : parsed.message ?? t("unknownError"));
     } finally { setIsCreating(false); }
   }
@@ -527,6 +619,7 @@ function validatePdfImagePages(value: string, totalPages: number): PdfImagesPrev
 
 function PdfToImagesPanel() {
   const { t } = useI18n();
+  const { settings } = useSettings();
   const [file, setFile] = useState<PdfItem | null>(null);
   const [destination, setDestination] = useState<string | null>(null);
   const [pageMode, setPageMode] = useState<PdfImagesPageMode>("all");
@@ -627,6 +720,7 @@ function PdfToImagesPanel() {
     if (isConverting) return;
     setIsConverting(true); setNotice(null); setOpenImageError(null); setResult(null);
     setProgress({ completed: 0, total: preview.count, percent: 0, currentPage: 0, currentFile: "" });
+    const startTime = Date.now();
     try {
       const response = await invoke<PdfImagesResult>("pdf_to_images", { request: {
         path: file.path, destinationDir: destination, pageMode,
@@ -635,11 +729,50 @@ function PdfToImagesPanel() {
         format, quality, dpi: resolution === "custom" ? Number(customDpi) : Number(resolution),
         transparentBackground: format === "png" && transparent, password: password || null,
       }});
+      const durationMs = Date.now() - startTime;
+      const historyEntries: ProcessingHistoryEntry[] = [
+        ...response.files.map((output) => createPdfProcessingHistoryEntry({
+          tool: "PDF to Images",
+          sourceFileName: `${file.name} (page ${output.page})`,
+          resultPath: output.path,
+          success: true,
+          originalSize: file.size,
+          finalSize: output.size,
+          durationMs,
+        })),
+        ...response.failures.map((failure) => createPdfProcessingHistoryEntry({
+          tool: "PDF to Images",
+          sourceFileName: `${file.name} (page ${failure.page})`,
+          success: false,
+          originalSize: file.size,
+          durationMs,
+          errorMessage: failure.message || failure.code,
+        })),
+      ];
+      if (historyEntries.length === 0) {
+        historyEntries.push(createPdfProcessingHistoryEntry({
+          tool: "PDF to Images",
+          sourceFileName: file.name,
+          success: false,
+          originalSize: file.size,
+          durationMs,
+          errorMessage: response.errorMessage ?? (response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError", { pages: file.pages }) : t("unknownError")),
+        }));
+      }
+      void appendProcessingHistoryEntries(historyEntries, settings.enableProcessingHistory);
       setResult(response.files.length || response.failures.length ? response : null);
       if (response.success) setNotice(response.failedCount ? t("pdfImagesPartialComplete", { success: response.files.length, failed: response.failedCount }) : t("pdfImagesComplete", { count: response.files.length }));
       else setNotice(response.errorCode ? t(errorKeys[response.errorCode] ?? "unknownError", { pages: file.pages }) : response.errorMessage ?? t("unknownError"));
     } catch (error) {
       const parsed = parseError(error);
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "PDF to Images",
+        sourceFileName: file.name,
+        success: false,
+        originalSize: file.size,
+        durationMs: Date.now() - startTime,
+        errorMessage: parsed.message ?? (parsed.code ? t(errorKeys[parsed.code] ?? "unknownError", { pages: file.pages }) : t("unknownError")),
+      }), settings.enableProcessingHistory);
       setNotice(parsed.code ? t(errorKeys[parsed.code] ?? "unknownError", { pages: file.pages }) : parsed.message ?? t("unknownError"));
     } finally { setIsConverting(false); }
   }
@@ -730,6 +863,7 @@ function PdfToImagesPanel() {
 
 export function PdfToolsPage() {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [tab, setTab] = useState<Tab>("merge");
   const [items, setItems] = useState<PdfItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
@@ -785,13 +919,36 @@ export function PdfToolsPage() {
     if (valid.length < 2) { setPageError(t("pdfNeedTwo")); return; }
     if (isMerging) return;
     setIsMerging(true); setProgress(8); setPageError(null); setResult(null);
+    const sourceFileName = joinSourceNames(valid.map((item) => item.name));
+    const originalSize = valid.reduce((total, item) => total + item.size, 0);
+    const startTime = Date.now();
     const timer = window.setInterval(() => setProgress((value) => Math.min(value + Math.max(1, Math.round((92 - value) / 8)), 92)), 180);
     try {
       const response = await invoke<MergeResult>("merge_pdfs", { request: { paths: valid.map((item) => item.path), destinationDir: destination, outputName } });
+      const durationMs = Date.now() - startTime;
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "Merge PDFs",
+        sourceFileName,
+        resultPath: response.outputPath,
+        success: response.success,
+        originalSize,
+        finalSize: response.newSize,
+        durationMs,
+        errorMessage: response.success ? undefined : response.errorMessage ?? (response.errorCode ? message(response.errorCode, response.errorMessage) : t("unknownError")),
+      }), settings.enableProcessingHistory);
       setProgress(100); setResult(response);
       if (!response.success) setPageError(message(response.errorCode, response.errorMessage) ?? t("unknownError"));
     } catch (error) {
-      const parsed = parseError(error); setPageError(message(parsed.code, parsed.message) ?? t("unknownError"));
+      const parsed = parseError(error);
+      void appendProcessingHistoryEntry(createPdfProcessingHistoryEntry({
+        tool: "Merge PDFs",
+        sourceFileName,
+        success: false,
+        originalSize,
+        durationMs: Date.now() - startTime,
+        errorMessage: parsed.message ?? message(parsed.code, parsed.message) ?? t("unknownError"),
+      }), settings.enableProcessingHistory);
+      setPageError(message(parsed.code, parsed.message) ?? t("unknownError"));
     } finally { window.clearInterval(timer); setIsMerging(false); }
   }
 

@@ -460,6 +460,16 @@ fn write_unique(
     ))
 }
 
+fn output_size_with_cleanup<F>(path: &Path, metadata_len: F) -> Result<u64, PdfImagesError>
+where
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
+    metadata_len(path).map_err(|err| {
+        let _ = fs::remove_file(path);
+        error("pdf_images_write_error", err.to_string())
+    })
+}
+
 fn convert_sync<F>(
     request: PdfToImagesRequest,
     library: PathBuf,
@@ -574,9 +584,9 @@ where
             }
             let encoded = encode(&image, &request.format, request.quality)?;
             let output = write_unique(&destination, &stem, page_number, &request.format, &encoded)?;
-            let size = fs::metadata(&output)
-                .map_err(|err| error("pdf_images_write_error", err.to_string()))?
-                .len();
+            let size = output_size_with_cleanup(&output, |path| {
+                fs::metadata(path).map(|metadata| metadata.len())
+            })?;
             let name = output
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -1020,5 +1030,20 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "corrupted_pdf");
+    }
+
+    #[test]
+    fn removes_output_when_metadata_read_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("page.png");
+        fs::write(&output, b"complete output").unwrap();
+        let result = output_size_with_cleanup(&output, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "metadata failure",
+            ))
+        });
+        assert_eq!(result.unwrap_err().code, "pdf_images_write_error");
+        assert!(!output.exists());
     }
 }
