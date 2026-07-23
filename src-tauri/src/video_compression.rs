@@ -338,7 +338,7 @@ where
     if request.mode != "recommended" && request.mode != "targetQuality" {
         return Err(VideoCompressionError::new(
             "mode_not_implemented",
-            "Target File Size is not implemented.",
+            "The selected compression mode is unsupported.",
         ));
     }
     let selected_quality = if request.mode == "targetQuality" {

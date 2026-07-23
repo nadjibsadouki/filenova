@@ -20,8 +20,14 @@ import {
   UploadCloud,
   X,
 } from "lucide-react";
+import {
+  appendProcessingHistoryEntries,
+  createVideoProcessingHistoryEntry,
+  type ProcessingHistoryEntry,
+} from "../history";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { VideoToolRuntimeChange } from "../navigation";
+import { useSettings } from "../settings";
 
 type OutputFormat = "mp3" | "wav" | "m4a" | "flac" | "ogg";
 type Quality = "low" | "standard" | "high" | "maximum";
@@ -74,6 +80,7 @@ interface AudioItem extends Partial<AudioSourceInfo> {
   name: string;
   status: ItemStatus;
   errorCode?: string;
+  errorMessage?: string;
   plan?: AudioPlan;
   selectedTrack: number;
   result?: AudioResult;
@@ -172,6 +179,7 @@ interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeC
 
 export function ExtractAudioPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [items, setItems] = useState<AudioItem[]>([]);
   const [capabilities, setCapabilities] = useState<AudioCapabilities | null>(null);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp3");
@@ -241,19 +249,39 @@ export function ExtractAudioPage({ active = true, onRuntimeChange }: VideoPagePr
       selectedTrack: 0,
     }))]);
     for (const path of selected) {
+      const startedAt = Date.now();
       try {
         const info = await invoke<AudioSourceInfo>("inspect_audio_source", { path });
         setItems((current) => current.map((item) => item.path === path
           ? { ...info, status: info.audioCodec ? "ready" : "noAudio", selectedTrack: 0 }
           : item));
+        if (!info.audioCodec) {
+          void appendProcessingHistoryEntries([createVideoProcessingHistoryEntry({
+            tool: "Extract Audio",
+            sourceFileName: info.name,
+            success: false,
+            originalSize: info.size,
+            durationMs: Date.now() - startedAt,
+            errorMessage: "no_audio_stream",
+            details: `Requested audio format: ${outputFormat.toUpperCase()}`,
+          })], settings.enableProcessingHistory);
+        }
       } catch (error) {
         const parsed = parseError(error);
         setItems((current) => current.map((item) => item.path === path
-          ? { ...item, status: "failed", errorCode: parsed.code }
+          ? { ...item, status: "failed", errorCode: parsed.code, errorMessage: parsed.message }
           : item));
+        void appendProcessingHistoryEntries([createVideoProcessingHistoryEntry({
+          tool: "Extract Audio",
+          sourceFileName: nameFromPath(path),
+          success: false,
+          durationMs: Date.now() - startedAt,
+          errorMessage: parsed.message || parsed.code,
+          details: `Requested audio format: ${outputFormat.toUpperCase()}`,
+        })], settings.enableProcessingHistory);
       }
     }
-  }, []);
+  }, [outputFormat, settings.enableProcessingHistory]);
 
   useEffect(() => {
     if (!active) return;
@@ -348,6 +376,9 @@ export function ExtractAudioPage({ active = true, onRuntimeChange }: VideoPagePr
     setNotice(null);
     setBatchPosition({ current: 1, total: queue.length });
     cancellationRequested.current = false;
+    const historyEntries: ProcessingHistoryEntry[] = [];
+    const processedPaths = new Set<string>();
+    let batchCancelled = false;
     const paths = new Set(queue.map((item) => item.path));
     setItems((current) => current.map((item) => paths.has(item.path)
       ? { ...item, status: "waiting", errorCode: undefined }
@@ -355,6 +386,8 @@ export function ExtractAudioPage({ active = true, onRuntimeChange }: VideoPagePr
     for (let index = 0; index < queue.length; index += 1) {
       const item = queue[index];
       if (cancellationRequested.current) break;
+      processedPaths.add(item.path);
+      const startedAt = Date.now();
       setBatchPosition({ current: index + 1, total: queue.length });
       const phase = item.plan?.extractWithoutReencoding ? "copying" : "extracting";
       setActiveProgress({
@@ -386,20 +419,53 @@ export function ExtractAudioPage({ active = true, onRuntimeChange }: VideoPagePr
         setItems((current) => current.map((entry) => entry.path === item.path
           ? { ...entry, status: "completed", result }
           : entry));
+        historyEntries.push(createVideoProcessingHistoryEntry({
+          tool: "Extract Audio",
+          sourceFileName: item.name,
+          resultPath: result.outputPath,
+          success: true,
+          originalSize: item.size,
+          finalSize: result.finalSize,
+          durationMs: result.processingDurationSeconds * 1_000,
+          details: `Final audio format: ${result.finalFormat}`,
+        }));
       } catch (error) {
         const parsed = parseError(error);
         const cancelled = parsed.code === "extraction_cancelled";
+        batchCancelled ||= cancelled;
         setItems((current) => current.map((entry) => entry.path === item.path
-          ? { ...entry, status: cancelled ? "cancelled" : "failed", errorCode: parsed.code }
+          ? { ...entry, status: cancelled ? "cancelled" : "failed", errorCode: parsed.code, errorMessage: parsed.message }
           : entry));
+        historyEntries.push(createVideoProcessingHistoryEntry({
+          tool: "Extract Audio",
+          sourceFileName: item.name,
+          success: false,
+          cancelled,
+          originalSize: item.size,
+          durationMs: Date.now() - startedAt,
+          errorMessage: parsed.message || parsed.code,
+          details: `Requested audio format: ${outputFormat.toUpperCase()}`,
+        }));
         if (cancelled || cancellationRequested.current) break;
       }
     }
-    if (cancellationRequested.current) {
+    if (cancellationRequested.current || batchCancelled) {
+      const cancelledItems = queue.filter((item) => !processedPaths.has(item.path));
       setItems((current) => current.map((item) => item.status === "waiting"
         ? { ...item, status: "cancelled", errorCode: "extraction_cancelled" }
         : item));
+      historyEntries.push(...cancelledItems.map((item) => createVideoProcessingHistoryEntry({
+        tool: "Extract Audio",
+        sourceFileName: item.name,
+        success: false,
+        cancelled: true,
+        originalSize: item.size,
+        durationMs: 0,
+        errorMessage: "extraction_cancelled",
+        details: `Requested audio format: ${outputFormat.toUpperCase()}`,
+      })));
     }
+    void appendProcessingHistoryEntries(historyEntries, settings.enableProcessingHistory);
     setActiveProgress(null);
     setIsProcessing(false);
     cancellationRequested.current = false;

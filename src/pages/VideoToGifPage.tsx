@@ -21,8 +21,10 @@ import {
   UploadCloud,
   X,
 } from "lucide-react";
+import { appendProcessingHistoryEntry, createVideoProcessingHistoryEntry } from "../history";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { VideoToolRuntimeChange } from "../navigation";
+import { useSettings } from "../settings";
 import {
   calculateGifDimensions,
   estimateGif,
@@ -93,6 +95,10 @@ function errorMessage(reason: unknown) {
   return String(reason);
 }
 
+function gifErrorCode(reason: unknown) {
+  return reason && typeof reason === "object" && "code" in reason ? String(reason.code) : "gif_creation_failed";
+}
+
 function gifErrorKey(reason: unknown): TranslationKey | null {
   const code = reason && typeof reason === "object" && "code" in reason ? String(reason.code) : "";
   const keys: Record<string, TranslationKey> = {
@@ -111,6 +117,7 @@ interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeC
 
 export function VideoToGifPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [status, setStatus] = useState<"idle" | "analyzing" | "ready" | "failed">("idle");
   const [inspectionError, setInspectionError] = useState("");
@@ -214,6 +221,7 @@ export function VideoToGifPage({ active = true, onRuntimeChange }: VideoPageProp
   const selectedPlayCount = loop === "infinite" ? null : loop === "custom" ? customLoop : Number(loop);
   const nameInvalid = !outputName.trim() || outputName.includes("/") || outputName.includes("\\");
   const validPlan = !selectionError && !dimensionInvalid && !frameRateInvalid && !loopInvalid && !nameInvalid;
+  const canAttemptCreation = !!video && !isCreating;
   const startPercent = video?.durationSeconds ? start / video.durationSeconds * 100 : 0;
   const endPercent = video?.durationSeconds ? end / video.durationSeconds * 100 : 100;
 
@@ -265,7 +273,32 @@ export function VideoToGifPage({ active = true, onRuntimeChange }: VideoPageProp
   }
 
   async function createGif() {
-    if (!video || !validPlan || isCreating) return;
+    if (!video || isCreating) return;
+    const details = [
+      `Dimensions: ${dimensions.width}x${dimensions.height}`,
+      `Frame rate: ${selectedFrameRate} fps`,
+      `Start: ${formatGifTime(start)}`,
+      `Duration: ${formatGifTime(selectedDuration)}`,
+    ].join(" · ");
+    if (!validPlan) {
+      const validationError = selectionError
+        ?? (dimensionInvalid ? "gifInvalidDimensions"
+          : frameRateInvalid ? "gifInvalidFrameRate"
+            : loopInvalid ? "gifInvalidLoop"
+              : "gifInvalidName");
+      setCreationError(t(validationError));
+      void appendProcessingHistoryEntry(createVideoProcessingHistoryEntry({
+        tool: "Video to GIF",
+        sourceFileName: video.name,
+        success: false,
+        originalSize: video.size,
+        durationMs: 0,
+        errorMessage: validationError,
+        details,
+      }), settings.enableProcessingHistory);
+      return;
+    }
+    const startedAt = Date.now();
     setIsCreating(true);
     setCreationError("");
     setResult(null);
@@ -289,9 +322,35 @@ export function VideoToGifPage({ active = true, onRuntimeChange }: VideoPageProp
         },
       });
       setResult({ ...created, estimatedSize: estimate.estimatedBytes });
+      void appendProcessingHistoryEntry(createVideoProcessingHistoryEntry({
+        tool: "Video to GIF",
+        sourceFileName: video.name,
+        resultPath: created.outputPath,
+        success: true,
+        originalSize: video.size,
+        finalSize: created.finalSize,
+        durationMs: created.processingDurationSeconds * 1_000,
+        details: [
+          `Dimensions: ${created.width}x${created.height}`,
+          `Frame rate: ${created.framesPerSecond} fps`,
+          `Start: ${formatGifTime(created.startSeconds)}`,
+          `Duration: ${formatGifTime(created.durationSeconds)}`,
+        ].join(" · "),
+      }), settings.enableProcessingHistory);
     } catch (reason) {
       const key = gifErrorKey(reason);
       setCreationError(key ? t(key) : errorMessage(reason));
+      const code = gifErrorCode(reason);
+      void appendProcessingHistoryEntry(createVideoProcessingHistoryEntry({
+        tool: "Video to GIF",
+        sourceFileName: video.name,
+        success: false,
+        cancelled: code === "gif_cancelled",
+        originalSize: video.size,
+        durationMs: Date.now() - startedAt,
+        errorMessage: errorMessage(reason) || code,
+        details,
+      }), settings.enableProcessingHistory);
     } finally {
       setIsCreating(false);
       setProgress(null);
@@ -365,7 +424,7 @@ export function VideoToGifPage({ active = true, onRuntimeChange }: VideoPageProp
       {result && <section className="compress-panel trim-result"><div className="convert-result-mode"><CheckCircle2 size={14} />{t("gifCreationComplete")}</div><div className="convert-result-grid"><span><small>{t("gifEstimatedDuration")}</small><strong>{formatGifTime(result.durationSeconds)}</strong></span><span><small>{t("gifEstimatedDimensions")}</small><strong>{result.width} × {result.height}</strong></span><span><small>{t("gifEstimatedFrameRate")}</small><strong>{result.framesPerSecond} fps</strong></span><span><small>{t("gifAppliedProfile")}</small><strong>{t(result.profile === "small" ? "gifQualitySmall" : result.profile === "balanced" ? "gifQualityBalanced" : result.profile === "high" ? "gifQualityHigh" : "gifQualityMaximum")}</strong></span><span><small>{t("gifOptimizeColors")}</small><strong>{t(result.optimizeColors ? "enabled" : "disabled")}</strong></span><span><small>{t("gifDithering")}</small><strong>{result.optimizeColors ? result.dithering === "none" ? t("gifDitherNone") : result.dithering === "bayer" ? "Bayer" : "Floyd-Steinberg" : "—"}</strong></span><span><small>{t("convertFinalSize")}</small><strong>{formatBytes(result.finalSize)}</strong></span><span><small>{t("processingDuration")}</small><strong>{formatGifTime(result.processingDurationSeconds)}</strong></span></div><div className="video-result-location"><FolderOpen size={13} /><span title={result.outputPath}>{result.outputPath}</span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => void openPath(result.outputPath)}><Images size={13} />{t("gifOpen")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(result.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></section>}
       {result && <p className="gif-estimate-disclaimer">{t("gifLoopResult")}: <strong>{result.playCount === null ? t("gifLoopInfinite") : result.playCount === 1 ? t("gifLoopOnce") : `${result.playCount} ${t("gifPlays")}`}</strong> · {t("gifFrameCount")}: <strong>{result.frameCount}</strong></p>}
       {result && <section className="compress-panel gif-final-summary"><div className="convert-result-grid"><span><small>{t("trimRequestedStart")}</small><strong>{formatGifTime(result.startSeconds)}</strong></span><span><small>{t("trimRequestedEnd")}</small><strong>{formatGifTime(result.endSeconds)}</strong></span><span><small>{t("gifEstimatedFrames")}</small><strong>≈ {Math.ceil(result.durationSeconds * result.framesPerSecond)}</strong></span><span><small>{t("gifEstimatedSize")}</small><strong>≈ {formatBytes(result.estimatedSize)}</strong></span></div><div className="video-result-actions"><button className="text-button" type="button" onClick={() => setPreviewResult(true)}><Play size={13} />{t("gifPreview")}</button><button className="text-button" type="button" onClick={() => void openPath(result.outputPath)}><Images size={13} />{t("gifOpen")}</button><button className="text-button" type="button" onClick={() => void revealItemInDir(result.outputPath)}><FolderOpen size={13} />{t("openFolder")}</button></div></section>}
-      {isCreating ? <button className="run-button video-cancel-button gif-create-button" type="button" onClick={() => void cancelGif()}><Ban size={19} />{t("gifCancel")}</button> : <button className="run-button gif-create-button" type="button" disabled={!validPlan} title={!validPlan ? t("gifFixValidation") : undefined} onClick={() => void createGif()}><Images size={19} />{t("gifCreateAction")}</button>}
+      {isCreating ? <button className="run-button video-cancel-button gif-create-button" type="button" onClick={() => void cancelGif()}><Ban size={19} />{t("gifCancel")}</button> : <button className="run-button gif-create-button" type="button" disabled={!canAttemptCreation} title={!validPlan ? t("gifFixValidation") : undefined} onClick={() => void createGif()}><Images size={19} />{t("gifCreateAction")}</button>}
       {previewResult && result && <div className="video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setPreviewResult(false); }}><section className="pdf-image-preview-modal" role="dialog" aria-modal="true" aria-label={t("gifPreview")}><header><div><strong>{result.outputName}</strong><small>{result.width} × {result.height} · {result.framesPerSecond} fps</small></div><button className="icon-button" type="button" onClick={() => setPreviewResult(false)}><X size={17} /></button></header><div><img src={convertFileSrc(result.outputPath)} alt={result.outputName} /></div></section></div>}
     </>}
   </div>;

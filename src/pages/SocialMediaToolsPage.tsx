@@ -5,8 +5,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { AlertTriangle, Ban, Check, CheckCircle2, Clapperboard, Crop, FileVideo2, FolderOpen, Grid3X3, Play, Settings2, Trash2, UploadCloud, Video, X } from "lucide-react";
+import { appendProcessingHistoryEntries, createVideoProcessingHistoryEntry } from "../history";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { VideoToolRuntimeChange } from "../navigation";
+import { useSettings } from "../settings";
 import {
   customObjectPosition,
   plannedCrop,
@@ -96,10 +98,58 @@ function platformKey(platform: SocialPlatform): TranslationKey {
   return keys[platform];
 }
 
+function socialPlatformName(platform: SocialPlatform) {
+  const names: Record<SocialPlatform, string> = {
+    tiktok: "TikTok",
+    instagram: "Instagram",
+    youtube: "YouTube",
+    facebook: "Facebook",
+    linkedin: "LinkedIn",
+    x: "X",
+    custom: "Custom",
+  };
+  return names[platform];
+}
+
+function socialHistoryDetails(
+  platform: SocialPlatform,
+  presetId: string,
+  ratio: string,
+  width: number,
+  height: number,
+  method: SocialMethod,
+) {
+  const mode = method === "fit" ? "Fit" : method === "fill" ? "Fill" : "Stretch";
+  return [
+    `Platform: ${socialPlatformName(platform)}`,
+    `Preset: ${platform === "custom" ? "Custom" : presetId}`,
+    "Format: MP4",
+    `Ratio: ${ratio}`,
+    `Dimensions: ${width}x${height}`,
+    `Mode: ${mode}`,
+  ].join(" · ");
+}
+
+function parseSocialError(reason: unknown): { code: string; message: string } {
+  if (reason && typeof reason === "object") {
+    const value = reason as { code?: unknown; message?: unknown };
+    return {
+      code: String(value.code ?? "social_export_failed"),
+      message: typeof value.message === "string" ? value.message : "",
+    };
+  }
+  try {
+    return parseSocialError(JSON.parse(String(reason)));
+  } catch {
+    return { code: "social_export_failed", message: String(reason) };
+  }
+}
+
 interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeChange }
 
 export function SocialMediaToolsPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [video, setVideo] = useState<VideoInfo | null>(null);
   const [status, setStatus] = useState<"idle" | "analyzing" | "ready" | "failed">("idle");
   const [error, setError] = useState("");
@@ -209,6 +259,8 @@ export function SocialMediaToolsPage({ active = true, onRuntimeChange }: VideoPa
 
   async function exportVideo() {
     if (!video || !baseExportReady || isExporting) return;
+    const startedAt = Date.now();
+    const details = socialHistoryDetails(platform, presetId, targetRatio, targetWidth, targetHeight, method);
     setIsExporting(true);
     setExportError("");
     setExportResult(null);
@@ -251,8 +303,19 @@ export function SocialMediaToolsPage({ active = true, onRuntimeChange }: VideoPa
         originalSize: video.size,
         quality,
       });
+      void appendProcessingHistoryEntries([createVideoProcessingHistoryEntry({
+        tool: "Social Media Tools",
+        sourceFileName: video.name,
+        resultPath: result.outputPath,
+        success: true,
+        originalSize: video.size,
+        finalSize: result.finalSize,
+        durationMs: result.processingDurationSeconds * 1_000,
+        details: socialHistoryDetails(platform, presetId, ratioLabel(result.width, result.height), result.width, result.height, method),
+      })], settings.enableProcessingHistory);
     } catch (reason) {
-      const code = reason && typeof reason === "object" && "code" in reason ? String(reason.code) : "";
+      const parsed = parseSocialError(reason);
+      const code = parsed.code;
       const keys: Record<string, TranslationKey> = {
         social_export_busy: "socialExportBusy", ffmpeg_unavailable: "socialFfmpegUnavailable",
         ffprobe_unavailable: "socialFfprobeUnavailable", social_encoder_unavailable: "socialEncoderUnavailable",
@@ -267,6 +330,16 @@ export function SocialMediaToolsPage({ active = true, onRuntimeChange }: VideoPa
       };
       const key = keys[code];
       setExportError(key ? t(key) : String(reason));
+      void appendProcessingHistoryEntries([createVideoProcessingHistoryEntry({
+        tool: "Social Media Tools",
+        sourceFileName: video.name,
+        success: false,
+        cancelled: code === "social_export_cancelled",
+        originalSize: video.size,
+        durationMs: Date.now() - startedAt,
+        errorMessage: parsed.message || code,
+        details,
+      })], settings.enableProcessingHistory);
     } finally {
       setIsExporting(false);
       setExportProgress(null);

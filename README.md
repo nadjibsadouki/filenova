@@ -1,6 +1,6 @@
 # FileNova
 
-FileNova 0.2.0 is a private desktop workspace for everyday image, PDF, and video processing on Windows x64.
+FileNova 0.2.1 is a private desktop workspace for everyday image, PDF, and video processing on Windows x64.
 
 All processing runs locally on the user's computer. Files are never uploaded, and FileNova requires no account and no subscription. The interface is available in English, French, and Arabic, including right-to-left layout support for Arabic.
 
@@ -37,6 +37,16 @@ All processing runs locally on the user's computer. Files are never uploaded, an
 - No account required
 - No subscription required
 - English, French, and Arabic interface
+
+## Settings and Processing History
+
+- Light, Dark, and System appearance modes
+- Persistent language, appearance, output, and privacy preferences
+- Optional Processing History with a 500-entry limit
+- Image, PDF, and video results recorded locally
+- Open File and Open Folder actions for available results
+- Remove Entry, Clear History, Refresh, and Clear Filters actions
+- Completed, Failed, and Cancelled statuses with sizes, durations, and errors
 
 ## Development
 

@@ -22,8 +22,14 @@ import {
   Video,
   X,
 } from "lucide-react";
+import {
+  appendProcessingHistoryEntries,
+  createVideoProcessingHistoryEntry,
+  type ProcessingHistoryEntry,
+} from "../history";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { VideoToolRuntimeChange } from "../navigation";
+import { useSettings } from "../settings";
 
 type OutputFormat = "mp4" | "webm" | "mov" | "mkv";
 type VideoCodec = "auto" | "openh264" | "svtAv1" | "copy";
@@ -201,6 +207,7 @@ interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeC
 
 export function ConvertVideoPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [items, setItems] = useState<VideoItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp4");
@@ -277,6 +284,7 @@ export function ConvertVideoPage({ active = true, onRuntimeChange }: VideoPagePr
     setNotice(null);
     setItems((current) => [...current, ...unique.map((path) => ({ path, name: fileName(path), status: "analyzing" as const }))]);
     for (const path of unique) {
+      const startedAt = Date.now();
       try {
         const info = await invoke<VideoInfo>("inspect_video", { path });
         const preview = thumbnailUrl(info.thumbnailData);
@@ -285,9 +293,16 @@ export function ConvertVideoPage({ active = true, onRuntimeChange }: VideoPagePr
       } catch (error) {
         const parsed = parseError(error);
         setItems((current) => current.map((item) => item.path === path ? { ...item, status: "failed", errorCode: parsed.code, errorMessage: parsed.message } : item));
+        void appendProcessingHistoryEntries([createVideoProcessingHistoryEntry({
+          tool: "Convert Video",
+          sourceFileName: fileName(path),
+          success: false,
+          durationMs: Date.now() - startedAt,
+          errorMessage: parsed.message || parsed.code,
+        })], settings.enableProcessingHistory);
       }
     }
-  }, [items]);
+  }, [items, settings.enableProcessingHistory]);
 
   useEffect(() => {
     if (!active) return;
@@ -399,12 +414,17 @@ export function ConvertVideoPage({ active = true, onRuntimeChange }: VideoPagePr
     setNotice(null);
     setBatchPosition({ current: 1, total: queue.length });
     cancellationRequested.current = false;
+    const historyEntries: ProcessingHistoryEntry[] = [];
+    const processedPaths = new Set<string>();
+    let batchCancelled = false;
     const paths = new Set(queue.map((item) => item.path));
     setItems((current) => current.map((item) => paths.has(item.path) ? { ...item, status: "waiting", errorCode: undefined, errorMessage: undefined } : item));
 
     for (let index = 0; index < queue.length; index += 1) {
       const item = queue[index];
       if (cancellationRequested.current) break;
+      processedPaths.add(item.path);
+      const startedAt = Date.now();
       setBatchPosition({ current: index + 1, total: queue.length });
       const phase = item.plan?.remuxWithoutReencoding ? "remuxing" : "converting";
       setActiveProgress({ path: item.path, name: item.name, processedSeconds: 0, durationSeconds: item.durationSeconds ?? 0, percent: 0, phase });
@@ -427,16 +447,46 @@ export function ConvertVideoPage({ active = true, onRuntimeChange }: VideoPagePr
           },
         });
         setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, status: "completed", result } : entry));
+        historyEntries.push(createVideoProcessingHistoryEntry({
+          tool: "Convert Video",
+          sourceFileName: item.name,
+          resultPath: result.outputPath,
+          success: true,
+          originalSize: result.originalSize,
+          finalSize: result.finalSize,
+          durationMs: result.processingDurationSeconds * 1_000,
+        }));
       } catch (error) {
         const parsed = parseError(error);
         const cancelled = parsed.code === "conversion_cancelled";
+        batchCancelled ||= cancelled;
         setItems((current) => current.map((entry) => entry.path === item.path ? { ...entry, status: cancelled ? "cancelled" : "failed", errorCode: parsed.code, errorMessage: parsed.message } : entry));
+        historyEntries.push(createVideoProcessingHistoryEntry({
+          tool: "Convert Video",
+          sourceFileName: item.name,
+          success: false,
+          cancelled,
+          originalSize: item.size,
+          durationMs: Date.now() - startedAt,
+          errorMessage: parsed.message || parsed.code,
+        }));
         if (cancelled || cancellationRequested.current) break;
       }
     }
-    if (cancellationRequested.current) {
+    if (cancellationRequested.current || batchCancelled) {
+      const cancelledItems = queue.filter((item) => !processedPaths.has(item.path));
       setItems((current) => current.map((item) => item.status === "waiting" ? { ...item, status: "cancelled", errorCode: "conversion_cancelled" } : item));
+      historyEntries.push(...cancelledItems.map((item) => createVideoProcessingHistoryEntry({
+        tool: "Convert Video",
+        sourceFileName: item.name,
+        success: false,
+        cancelled: true,
+        originalSize: item.size,
+        durationMs: 0,
+        errorMessage: "conversion_cancelled",
+      })));
     }
+    void appendProcessingHistoryEntries(historyEntries, settings.enableProcessingHistory);
     setActiveProgress(null);
     setIsProcessing(false);
     cancellationRequested.current = false;

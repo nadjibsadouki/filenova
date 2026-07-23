@@ -24,8 +24,14 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
+import {
+  appendProcessingHistoryEntries,
+  createVideoProcessingHistoryEntry,
+  type ProcessingHistoryEntry,
+} from "../history";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { VideoToolRuntimeChange } from "../navigation";
+import { useSettings } from "../settings";
 import {
   chooseTargetResolution,
   calculateTargetBitrates,
@@ -217,6 +223,7 @@ interface VideoPageProps { active?: boolean; onRuntimeChange?: VideoToolRuntimeC
 
 export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageProps) {
   const { t, language, setLanguage } = useI18n();
+  const { settings } = useSettings();
   const [items, setItems] = useState<VideoItem[]>([]);
   const [destination, setDestination] = useState<string | null>(null);
   const [mode, setMode] = useState<VideoMode>("recommended");
@@ -251,6 +258,7 @@ export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageP
     ]);
 
     for (const path of unique) {
+      const startedAt = Date.now();
       try {
         const info = await invoke<VideoInfo>("inspect_video", { path });
         const preview = thumbnailUrl(info.thumbnailData);
@@ -277,9 +285,16 @@ export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageP
           errorCode: parsed.code,
           errorMessage: parsed.message,
         } : item));
+        void appendProcessingHistoryEntries([createVideoProcessingHistoryEntry({
+          tool: "Compress Video",
+          sourceFileName: fileNameFromPath(path),
+          success: false,
+          durationMs: Date.now() - startedAt,
+          errorMessage: parsed.message || parsed.code,
+        })], settings.enableProcessingHistory);
       }
     }
-  }, [items]);
+  }, [items, settings.enableProcessingHistory]);
 
   useEffect(() => {
     if (!active) return;
@@ -466,6 +481,9 @@ export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageP
     setPageError(null);
     setBatchPosition({ current: 1, total: queue.length });
     cancellationRequested.current = false;
+    const historyEntries: ProcessingHistoryEntry[] = [];
+    const processedPaths = new Set<string>();
+    let batchCancelled = false;
     if (mode === "targetFileSize") {
       const queuedPaths = new Set(queue.map((item) => item.path));
       setItems((current) => current.map((entry) => queuedPaths.has(entry.path) ? {
@@ -479,6 +497,8 @@ export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageP
     for (let index = 0; index < queue.length; index += 1) {
       const item = queue[index];
       if (cancellationRequested.current) break;
+      processedPaths.add(item.path);
+      const startedAt = Date.now();
       setBatchPosition({ current: index + 1, total: queue.length });
       setActiveProgress({ path: item.path, name: item.name, processedSeconds: 0, durationSeconds: item.durationSeconds ?? 0, percent: 0, overallPercent: 0, phase: mode === "targetFileSize" ? "encodingAttempt1" : "encoding", attempt: 1 });
       setItems((current) => current.map((entry) => entry.path === item.path ? {
@@ -511,26 +531,60 @@ export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageP
           status: "completed",
           result,
         } : entry));
+        if (!result.pendingConfirmation) {
+          historyEntries.push(createVideoProcessingHistoryEntry({
+            tool: "Compress Video",
+            sourceFileName: item.name,
+            resultPath: result.outputPath,
+            success: true,
+            originalSize: result.originalSize,
+            finalSize: result.compressedSize,
+            durationMs: result.processingDurationSeconds === null
+              ? Date.now() - startedAt
+              : result.processingDurationSeconds * 1_000,
+          }));
+        }
       } catch (error) {
         const parsed = parseCommandError(error);
         const cancelled = parsed.code === "compression_cancelled";
+        batchCancelled ||= cancelled;
         setItems((current) => current.map((entry) => entry.path === item.path ? {
           ...entry,
           status: cancelled ? "cancelled" : "failed",
           errorCode: parsed.code,
           errorMessage: parsed.message,
         } : entry));
+        historyEntries.push(createVideoProcessingHistoryEntry({
+          tool: "Compress Video",
+          sourceFileName: item.name,
+          success: false,
+          cancelled,
+          originalSize: item.size,
+          durationMs: Date.now() - startedAt,
+          errorMessage: parsed.message || parsed.code,
+        }));
         if (cancelled || cancellationRequested.current) break;
       }
     }
 
-    if (cancellationRequested.current) {
+    if (cancellationRequested.current || batchCancelled) {
+      const cancelledItems = queue.filter((item) => !processedPaths.has(item.path));
       setItems((current) => current.map((entry) => entry.status === "waiting" ? {
         ...entry,
         status: "cancelled",
         errorCode: "compression_cancelled",
       } : entry));
+      historyEntries.push(...cancelledItems.map((item) => createVideoProcessingHistoryEntry({
+        tool: "Compress Video",
+        sourceFileName: item.name,
+        success: false,
+        cancelled: true,
+        originalSize: item.size,
+        durationMs: 0,
+        errorMessage: "compression_cancelled",
+      })));
     }
+    void appendProcessingHistoryEntries(historyEntries, settings.enableProcessingHistory);
     setIsProcessing(false);
     setActiveProgress(null);
     cancellationRequested.current = false;
@@ -569,6 +623,15 @@ export function CompressVideoPage({ active = true, onRuntimeChange }: VideoPageP
     if (!item.result?.pendingConfirmation || isProcessing) return;
     try {
       const kept = await invoke<{ outputPath: string; outputName: string }>("keep_video_target_result", { path: item.result.outputPath });
+      void appendProcessingHistoryEntries([createVideoProcessingHistoryEntry({
+        tool: "Compress Video",
+        sourceFileName: item.name,
+        resultPath: kept.outputPath,
+        success: true,
+        originalSize: item.result.originalSize,
+        finalSize: item.result.compressedSize,
+        durationMs: (item.result.processingDurationSeconds ?? 0) * 1_000,
+      })], settings.enableProcessingHistory);
       setItems((current) => current.map((entry) => entry.path === item.path && entry.result ? {
         ...entry,
         resultKept: true,

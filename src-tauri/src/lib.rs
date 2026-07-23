@@ -3,6 +3,7 @@ mod audio_extraction_plan;
 mod compression;
 mod conversion;
 mod images_pdf;
+mod history_actions;
 #[cfg(test)]
 mod navigation_contract;
 mod pdf_merge;
@@ -34,6 +35,7 @@ use audio_extraction_plan::{
 use compression::{compress_image, inspect_image};
 use conversion::{convert_image, inspect_convertible_image};
 use images_pdf::images_to_pdf;
+use history_actions::check_processing_result_availability;
 use pdf_merge::{inspect_pdf, merge_pdfs};
 use pdf_organize::organize_pdf;
 use pdf_split::split_pdf;
@@ -113,7 +115,8 @@ pub fn run() {
             create_video_gif,
             cancel_video_gif,
             export_social_media_video,
-            cancel_social_media_export
+            cancel_social_media_export,
+            check_processing_result_availability
         ])
         .run(tauri::generate_context!())
         .expect("error while running FileNova");

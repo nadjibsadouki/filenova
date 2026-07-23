@@ -7,6 +7,13 @@ export type PdfProcessingHistoryTool =
   | "Organize Pages"
   | "Images to PDF"
   | "PDF to Images";
+export type VideoProcessingHistoryTool =
+  | "Compress Video"
+  | "Convert Video"
+  | "Extract Audio"
+  | "Trim Video"
+  | "Video to GIF"
+  | "Social Media Tools";
 
 export interface ProcessingHistoryEntry {
   id: string;
@@ -21,6 +28,7 @@ export interface ProcessingHistoryEntry {
   finalSize?: number;
   durationMs?: number;
   errorMessage?: string;
+  details?: string;
 }
 
 export interface ImageProcessingHistoryInput {
@@ -51,8 +59,28 @@ export interface PdfProcessingHistoryInput {
   errorMessage?: string;
 }
 
+export interface VideoProcessingHistoryInput {
+  id?: string;
+  datetime?: string;
+  tool: VideoProcessingHistoryTool;
+  sourceFileName: string;
+  resultPath?: string;
+  success: boolean;
+  cancelled?: boolean;
+  originalSize?: number;
+  finalSize?: number;
+  durationMs?: number;
+  errorMessage?: string;
+  details?: string;
+}
+
 export interface ProcessingHistoryChangedDetail {
   entries: ProcessingHistoryEntry[];
+}
+
+export interface ProcessingHistoryMutationResult {
+  entries: ProcessingHistoryEntry[];
+  success: boolean;
 }
 
 export const PROCESSING_HISTORY_CHANGED_EVENT = "filenova-processing-history-changed";
@@ -74,6 +102,7 @@ function isHistoryEntry(entry: ProcessingHistoryEntry): boolean {
     && typeof entry?.createdFileName === "string"
     && typeof entry?.createdFilePath === "string"
     && ["Completed", "Failed", "Cancelled"].includes(entry?.status)
+    && (entry.details === undefined || typeof entry.details === "string")
   );
   return hasRequiredFields && (
     entry.status !== "Completed"
@@ -152,6 +181,23 @@ function enqueueMutation(operation: () => ProcessingHistoryEntry[]): Promise<Pro
   return result.catch(() => readHistorySafely());
 }
 
+function enqueueMutationResult(
+  operation: () => ProcessingHistoryMutationResult,
+): Promise<ProcessingHistoryMutationResult> {
+  const result = mutationQueue.then(() => {
+    try {
+      return operation();
+    } catch {
+      return { entries: readHistorySafely(), success: false };
+    }
+  });
+  mutationQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result.catch(() => ({ entries: readHistorySafely(), success: false }));
+}
+
 function newHistoryId(): string {
   try {
     if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -225,8 +271,42 @@ export function createPdfProcessingHistoryEntry(input: PdfProcessingHistoryInput
   };
 }
 
+export function createVideoProcessingHistoryEntry(input: VideoProcessingHistoryInput): ProcessingHistoryEntry {
+  const resultPath = input.resultPath?.trim() ?? "";
+  const completed = !input.cancelled && input.success && resultPath.length > 0;
+  const status: ProcessingHistoryStatus = input.cancelled
+    ? "Cancelled"
+    : completed
+      ? "Completed"
+      : "Failed";
+  const createdFilePath = completed ? resultPath : "";
+
+  return {
+    id: input.id ?? newHistoryId(),
+    datetime: input.datetime ?? new Date().toISOString(),
+    category: "Video",
+    tool: input.tool,
+    sourceFileName: input.sourceFileName,
+    createdFileName: fileNameFromPath(createdFilePath),
+    createdFilePath,
+    status,
+    originalSize: input.originalSize,
+    finalSize: completed ? input.finalSize : undefined,
+    durationMs: safeDuration(input.durationMs),
+    errorMessage: status === "Failed" && input.success && !resultPath
+      ? input.errorMessage ?? "Processing reported success without a result path."
+      : input.errorMessage,
+    details: input.details,
+  };
+}
+
 export async function loadProcessingHistory(): Promise<ProcessingHistoryEntry[]> {
   return readHistorySafely();
+}
+
+export async function loadProcessingHistoryWithResult(): Promise<ProcessingHistoryMutationResult> {
+  const current = readHistoryState();
+  return { entries: current.entries, success: current.readable };
 }
 
 export function saveProcessingHistory(entries: ProcessingHistoryEntry[]): Promise<ProcessingHistoryEntry[]> {
@@ -240,6 +320,35 @@ export function saveProcessingHistory(entries: ProcessingHistoryEntry[]): Promis
 
 export function clearProcessingHistory(): Promise<ProcessingHistoryEntry[]> {
   return saveProcessingHistory([]);
+}
+
+export function clearProcessingHistoryWithResult(): Promise<ProcessingHistoryMutationResult> {
+  return enqueueMutationResult(() => {
+    const current = readHistoryState();
+    if (!current.readable) return { entries: [], success: false };
+    return serializeHistory([])
+      ? { entries: [], success: true }
+      : { entries: current.entries, success: false };
+  });
+}
+
+export function removeProcessingHistoryEntry(id: string): Promise<ProcessingHistoryMutationResult> {
+  const normalizedId = id.trim();
+  if (!normalizedId) {
+    return loadProcessingHistory().then((entries) => ({ entries, success: false }));
+  }
+
+  return enqueueMutationResult(() => {
+    const current = readHistoryState();
+    if (!current.readable) return { entries: [], success: false };
+    const updated = current.entries.filter((entry) => entry.id !== normalizedId);
+    if (updated.length === current.entries.length) {
+      return { entries: current.entries, success: true };
+    }
+    return serializeHistory(updated)
+      ? { entries: updated, success: true }
+      : { entries: current.entries, success: false };
+  });
 }
 
 export function appendProcessingHistoryEntry(

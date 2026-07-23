@@ -2,14 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "./i18n";
 import { Sidebar } from "./components/Sidebar";
 import { VideoToolNavigation } from "./components/VideoToolNavigation";
-import { isVideoToolPage, navigationItems, type PageId, type VideoToolPageId, type VideoToolRuntimeChange } from "./navigation";
+import { isVideoToolPage, type PageId, type VideoToolPageId, type VideoToolRuntimeChange } from "./navigation";
 import { HomePage } from "./pages/HomePage";
 import { CompressImagesPage } from "./pages/CompressImagesPage";
 import { ConvertImagesPage } from "./pages/ConvertImagesPage";
 import { ResizeImagesPage } from "./pages/ResizeImagesPage";
 import { PdfToolsPage } from "./pages/PdfToolsPage";
 import { ProcessingHistoryPage } from "./pages/ProcessingHistoryPage";
-import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { CompressVideoPage } from "./pages/CompressVideoPage";
 import { ConvertVideoPage } from "./pages/ConvertVideoPage";
 import { ExtractAudioPage } from "./pages/ExtractAudioPage";
@@ -26,8 +25,6 @@ function App() {
   const [processing, setProcessing] = useState<Partial<Record<VideoToolPageId, boolean>>>({});
   const [pendingNavigation, setPendingNavigation] = useState<{ from: VideoToolPageId; to: PageId } | null>(null);
   const cancelHandlers = useRef<Partial<Record<VideoToolPageId, () => Promise<void>>>>({});
-  const currentPage = navigationItems.find((item) => item.id === activePage);
-
   const registerRuntime = useCallback<VideoToolRuntimeChange>((page, running, cancel) => {
     cancelHandlers.current[page] = cancel;
     setProcessing((current) => current[page] === running ? current : { ...current, [page]: running });
@@ -71,10 +68,7 @@ function App() {
           <ProcessingHistoryPage />
         ) : activePage === "settings" ? (
           <SettingsPage />
-        ) : activePage === "video-tools" || isVideoToolPage(activePage) ? null
-        : currentPage ? (
-          <PlaceholderPage page={currentPage} />
-        ) : (
+        ) : activePage === "video-tools" || isVideoToolPage(activePage) ? null : (
           <HomePage onNavigate={navigate} />
         )}
         {videoWorkspaceMounted && <div className="video-tools-workspace">

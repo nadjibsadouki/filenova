@@ -1,6 +1,6 @@
 FileNova distributions
 
-This workspace provides two distribution options for FileNova (version 0.2.0):
+This workspace provides two distribution options for FileNova (version 0.2.1):
 
 1) FileNova Standard
 - Lightweight installer (current generated NSIS and MSI in `src-tauri/target/release/bundle/`).
