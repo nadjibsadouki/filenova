@@ -22,3 +22,33 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+# Rust / Tauri build files
+src-tauri/target/
+target/
+
+# Installation test files
+install_test/
+
+# Generated installers and archives
+*.exe
+*.msi
+*.zip
+
+# Environment and private configuration
+.env
+.env.*
+!.env.example
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+Thumbs.db
+
+# Local test reports
+test-*.txt
+*-report.txt
+
+# Tauri development logs
+.tauri-dev.stdout.log
+.tauri-dev.stderr.log
